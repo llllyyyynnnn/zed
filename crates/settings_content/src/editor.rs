@@ -8,6 +8,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{
     DelayMs, DiagnosticSeverityContent, ShowScrollbar, serialize_f32_with_two_decimal_places,
+    serialize_optional_f32_with_two_decimal_places,
 };
 
 #[with_fallible_options]
@@ -22,6 +23,10 @@ pub struct EditorSettingsContent {
     ///
     /// Default: bar
     pub cursor_shape: Option<CursorShape>,
+    /// Controls optional editor cursor animation.
+    ///
+    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "min_height_scale": 0.65, "max_width_scale": 1.6 }
+    pub cursor_animation: Option<CursorAnimationSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
     /// Default: inline
@@ -806,6 +811,37 @@ pub enum CursorShape {
     Underline,
     /// A box drawn around the following character
     Hollow,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct CursorAnimationSettingsContent {
+    /// Whether the editor cursor animates.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Whether the cursor animates between positions.
+    ///
+    /// Default: true
+    pub movement: Option<bool>,
+    /// Whether the cursor shape changes during movement.
+    ///
+    /// Default: true
+    pub shape: Option<bool>,
+    /// Cursor animation duration in milliseconds.
+    ///
+    /// Default: 140
+    pub duration_ms: Option<DelayMs>,
+    /// Minimum height scale for line-like cursors during movement.
+    ///
+    /// Default: 0.65
+    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
+    pub min_height_scale: Option<f32>,
+    /// Maximum width scale for line-like cursors during movement.
+    ///
+    /// Default: 1.6
+    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
+    pub max_width_scale: Option<f32>,
 }
 
 /// What to do when go to definition yields no results.

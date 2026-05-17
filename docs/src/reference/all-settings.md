@@ -779,6 +779,25 @@ List of `string` values
 }
 ```
 
+## Cursor Animation
+
+- Description: Controls optional editor cursor movement and shape animation.
+- Setting: `cursor_animation`
+- Default: `{ "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "min_height_scale": 0.65, "max_width_scale": 1.6 }`
+
+```json [settings]
+{
+  "cursor_animation": {
+    "enabled": true,
+    "movement": true,
+    "shape": true,
+    "duration_ms": 140,
+    "min_height_scale": 0.65,
+    "max_width_scale": 1.6
+  }
+}
+```
+
 ## Gutter
 
 - Description: Settings for the editor gutter

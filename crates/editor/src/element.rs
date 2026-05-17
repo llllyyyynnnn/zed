@@ -17,9 +17,9 @@ use crate::{
         HighlightKey, HighlightedChunk, ToDisplayPoint,
     },
     editor_settings::{
-        CurrentLineHighlight, DocumentColorsRenderMode, DoubleClickInMultibuffer, Minimap,
-        MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes,
-        ScrollbarDiagnostics, ShowMinimap,
+        CurrentLineHighlight, CursorAnimationSettings, DocumentColorsRenderMode,
+        DoubleClickInMultibuffer, Minimap, MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine,
+        ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
@@ -41,14 +41,15 @@ use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatu
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
     Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
-    Edges, Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero, Length,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
-    MousePressureEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, PressureStage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Size, StatefulInteractiveElement,
-    Style, Styled, StyledText, TaskExt, TextAlign, TextRun, TextStyleRefinement, WeakEntity,
-    Window, anchored, deferred, div, fill, linear_color_stop, linear_gradient, outline,
-    pattern_slash, point, px, quad, relative, size, solid_background, transparent_black,
+    Edges, Element, ElementId, ElementInputHandler, Entity, EntityId, Focusable as _, Font, FontId,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement,
+    IsZero, Length, Modifiers, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
+    PressureStage, ScrollDelta, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Size,
+    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
+    TextStyleRefinement, WeakEntity, Window, anchored, deferred, div, fill, linear_color_stop,
+    linear_gradient, outline, pattern_slash, point, px, quad, relative, size, solid_background,
+    transparent_black,
 };
 use itertools::Itertools;
 use language::{
@@ -85,7 +86,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sum_tree::Bias;
-use text::{BufferId, SelectionGoal};
+use text::{BufferId, ReplicaId, SelectionGoal};
 use theme::{ActiveTheme, Appearance, PlayerColor};
 use theme_settings::BufferLineHeight;
 use ui::utils::ensure_minimum_contrast;
@@ -114,11 +115,27 @@ struct LineHighlightSpec {
 struct SelectionLayout {
     head: DisplayPoint,
     cursor_shape: CursorShape,
+    cursor_animation_key: Option<CursorAnimationKey>,
     is_newest: bool,
     is_local: bool,
     range: Range<DisplayPoint>,
     active_rows: Range<DisplayRow>,
     user_name: Option<SharedString>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CursorAnimationKey {
+    replica_id: ReplicaId,
+    selection_id: usize,
+}
+
+impl CursorAnimationKey {
+    fn new(replica_id: ReplicaId, selection_id: usize) -> Self {
+        Self {
+            replica_id,
+            selection_id,
+        }
+    }
 }
 
 struct InlineBlameLayout {
@@ -134,11 +151,14 @@ impl SelectionLayout {
         line_mode: bool,
         cursor_offset: bool,
         cursor_shape: CursorShape,
+        cursor_animation_replica_id: Option<ReplicaId>,
         map: &DisplaySnapshot,
         is_newest: bool,
         is_local: bool,
         user_name: Option<SharedString>,
     ) -> Self {
+        let cursor_animation_key = cursor_animation_replica_id
+            .map(|replica_id| CursorAnimationKey::new(replica_id, selection.id));
         let point_selection = selection.map(|p| p.to_point(map.buffer_snapshot()));
         let display_selection = point_selection.map(|p| p.to_display_point(map));
         let mut range = display_selection.range();
@@ -176,6 +196,7 @@ impl SelectionLayout {
         Self {
             head,
             cursor_shape,
+            cursor_animation_key,
             is_newest,
             is_local,
             range,
@@ -1582,6 +1603,7 @@ impl EditorElement {
                         editor.selections.line_mode(),
                         editor.cursor_offset_on_selection,
                         editor.cursor_shape,
+                        Some(ReplicaId::LOCAL),
                         &snapshot.display_snapshot,
                         is_newest,
                         editor.leader_id.is_none(),
@@ -1629,6 +1651,7 @@ impl EditorElement {
                         false,
                         editor.cursor_offset_on_selection,
                         CursorShape::Bar,
+                        None,
                         &snapshot.display_snapshot,
                         false,
                         false,
@@ -1693,6 +1716,7 @@ impl EditorElement {
                             selection.line_mode,
                             editor.cursor_offset_on_selection,
                             selection.cursor_shape,
+                            Some(selection.replica_id),
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1713,6 +1737,7 @@ impl EditorElement {
                             line_mode,
                             cursor_offset_on_selection,
                             cursor_shape,
+                            Some(ReplicaId::LOCAL),
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1800,10 +1825,12 @@ impl EditorElement {
         cx: &mut App,
     ) -> Vec<CursorLayout> {
         let mut autoscroll_bounds = None;
+        let editor_id = self.editor.entity_id();
         let cursor_layouts = self.editor.update(cx, |editor, cx| {
             let mut cursors = Vec::new();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
+            let cursor_animation_settings = EditorSettings::get_global(cx).cursor_animation;
 
             for (player_color, selections) in selections {
                 for selection in selections {
@@ -1939,8 +1966,12 @@ impl EditorElement {
                         color: player_color.cursor,
                         block_width,
                         origin: point(x, y),
+                        logical_position: cursor_position,
                         line_height,
                         shape: selection.cursor_shape,
+                        cursor_animation_key: selection.cursor_animation_key,
+                        shape_width_scale: 1.0,
+                        shape_height_scale: 1.0,
                         block_text,
                         cursor_name: None,
                     };
@@ -1949,6 +1980,7 @@ impl EditorElement {
                         color: self.style.background,
                         is_top_row: cursor_position.row().0 == 0,
                     });
+                    cursor.apply_animation(editor_id, cursor_animation_settings, window);
                     cursor.layout(content_origin, cursor_name, window, cx);
                     cursors.push(cursor);
                 }
@@ -8037,6 +8069,7 @@ impl EditorElement {
                             head: start,
                             range: start..end,
                             cursor_shape: CursorShape::Bar,
+                            cursor_animation_key: None,
                             is_newest: false,
                             is_local: false,
                             active_rows: start.row()..end.row(),
@@ -10313,6 +10346,7 @@ impl Element for EditorElement {
                                 editor.selections.line_mode(),
                                 editor.cursor_offset_on_selection,
                                 editor.cursor_shape,
+                                Some(ReplicaId::LOCAL),
                                 &snapshot,
                                 true,
                                 true,
@@ -12363,10 +12397,14 @@ const LABEL_LINE_HEIGHT_PADDING_PX: f32 = 2.0;
 
 pub struct CursorLayout {
     origin: gpui::Point<Pixels>,
+    logical_position: DisplayPoint,
     block_width: Pixels,
     line_height: Pixels,
     color: Hsla,
     shape: CursorShape,
+    cursor_animation_key: Option<CursorAnimationKey>,
+    shape_width_scale: f32,
+    shape_height_scale: f32,
     block_text: Option<ShapedLine>,
     cursor_name: Option<AnyElement>,
 }
@@ -12376,6 +12414,157 @@ pub struct CursorName {
     string: SharedString,
     color: Hsla,
     is_top_row: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CursorAnimationState {
+    logical_position: DisplayPoint,
+    start_origin: gpui::Point<Pixels>,
+    target_origin: gpui::Point<Pixels>,
+    started_at: Instant,
+    duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CursorAnimationFrame {
+    origin: gpui::Point<Pixels>,
+    shape_impulse: f32,
+    is_animating: bool,
+}
+
+impl CursorAnimationState {
+    fn new(
+        logical_position: DisplayPoint,
+        origin: gpui::Point<Pixels>,
+        started_at: Instant,
+        duration: Duration,
+    ) -> Self {
+        Self {
+            logical_position,
+            start_origin: origin,
+            target_origin: origin,
+            started_at,
+            duration,
+        }
+    }
+
+    fn frame(
+        &self,
+        now: Instant,
+        movement_enabled: bool,
+        shape_enabled: bool,
+    ) -> CursorAnimationFrame {
+        let delta = cursor_animation_delta(self.started_at, self.duration, now);
+        let motion_delta = cursor_motion_delta(delta);
+        CursorAnimationFrame {
+            origin: if movement_enabled {
+                interpolate_point(self.start_origin, self.target_origin, motion_delta)
+            } else {
+                self.target_origin
+            },
+            shape_impulse: if shape_enabled {
+                cursor_shape_impulse(delta)
+            } else {
+                0.0
+            },
+            is_animating: delta < 1.0,
+        }
+    }
+
+    fn settled(
+        logical_position: DisplayPoint,
+        origin: gpui::Point<Pixels>,
+        now: Instant,
+        duration: Duration,
+    ) -> Self {
+        let started_at = now.checked_sub(duration).unwrap_or(now);
+        Self::new(logical_position, origin, started_at, duration)
+    }
+}
+
+fn cursor_animation_delta(started_at: Instant, duration: Duration, now: Instant) -> f32 {
+    if duration.is_zero() {
+        return 1.0;
+    }
+
+    (now.saturating_duration_since(started_at).as_secs_f32() / duration.as_secs_f32())
+        .clamp(0.0, 1.0)
+}
+
+fn cursor_motion_delta(delta: f32) -> f32 {
+    1.0 - (1.0 - delta).powi(3)
+}
+
+fn cursor_shape_impulse(delta: f32) -> f32 {
+    (delta * std::f32::consts::PI).sin().max(0.0)
+}
+
+fn interpolate_point(
+    start: gpui::Point<Pixels>,
+    end: gpui::Point<Pixels>,
+    delta: f32,
+) -> gpui::Point<Pixels> {
+    point(
+        interpolate_pixels(start.x, end.x, delta),
+        interpolate_pixels(start.y, end.y, delta),
+    )
+}
+
+fn interpolate_pixels(start: Pixels, end: Pixels, delta: f32) -> Pixels {
+    start + (end - start) * delta
+}
+
+fn update_cursor_animation_state(
+    state: Option<CursorAnimationState>,
+    logical_position: DisplayPoint,
+    target_origin: gpui::Point<Pixels>,
+    now: Instant,
+    duration: Duration,
+    settings: CursorAnimationSettings,
+) -> (CursorAnimationFrame, CursorAnimationState) {
+    let Some(mut state) = state else {
+        return (
+            CursorAnimationFrame {
+                origin: target_origin,
+                shape_impulse: 0.0,
+                is_animating: false,
+            },
+            CursorAnimationState::settled(logical_position, target_origin, now, duration),
+        );
+    };
+
+    if state.logical_position != logical_position {
+        let current = state.frame(now, settings.movement, settings.shape);
+        state = CursorAnimationState {
+            logical_position,
+            start_origin: if settings.movement {
+                current.origin
+            } else {
+                target_origin
+            },
+            target_origin,
+            started_at: now,
+            duration,
+        };
+    } else if state.target_origin != target_origin {
+        state = CursorAnimationState::settled(logical_position, target_origin, now, duration);
+    } else if state.duration != duration {
+        state.duration = duration;
+    }
+
+    let frame = state.frame(now, settings.movement, settings.shape);
+    if frame.is_animating {
+        (frame, state)
+    } else {
+        (
+            CursorAnimationFrame {
+                origin: target_origin,
+                shape_impulse: 0.0,
+                is_animating: false,
+            },
+            CursorAnimationState::settled(logical_position, target_origin, now, duration),
+        )
+    }
 }
 
 impl CursorLayout {
@@ -12389,10 +12578,14 @@ impl CursorLayout {
     ) -> CursorLayout {
         CursorLayout {
             origin,
+            logical_position: DisplayPoint::new(DisplayRow(0), 0),
             block_width,
             line_height,
             color,
             shape,
+            cursor_animation_key: None,
+            shape_width_scale: 1.0,
+            shape_height_scale: 1.0,
             block_text,
             cursor_name: None,
         }
@@ -12407,20 +12600,93 @@ impl CursorLayout {
 
     fn bounds(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
         match self.shape {
-            CursorShape::Bar => Bounds {
-                origin: self.origin + origin,
-                size: size(px(2.0), self.line_height),
-            },
+            CursorShape::Bar => {
+                let width = px(2.0) * self.shape_width_scale;
+                let height = self.line_height * self.shape_height_scale;
+                Bounds {
+                    origin: self.origin
+                        + origin
+                        + point((px(2.0) - width) / 2., (self.line_height - height) / 2.),
+                    size: size(width, height),
+                }
+            }
             CursorShape::Block | CursorShape::Hollow => Bounds {
                 origin: self.origin + origin,
                 size: size(self.block_width, self.line_height),
             },
-            CursorShape::Underline => Bounds {
-                origin: self.origin
-                    + origin
-                    + gpui::Point::new(Pixels::ZERO, self.line_height - px(2.0)),
-                size: size(self.block_width, px(2.0)),
-            },
+            CursorShape::Underline => {
+                let width = self.block_width * self.shape_width_scale;
+                let height = px(2.0) * self.shape_height_scale;
+                Bounds {
+                    origin: self.origin
+                        + origin
+                        + point((self.block_width - width) / 2., self.line_height - height),
+                    size: size(width, height),
+                }
+            }
+        }
+    }
+
+    fn apply_animation(
+        &mut self,
+        editor_id: EntityId,
+        settings: CursorAnimationSettings,
+        window: &mut Window,
+    ) {
+        let Some(key) = self.cursor_animation_key else {
+            return;
+        };
+
+        if !settings.is_active() {
+            return;
+        }
+
+        let duration = Duration::from_millis(settings.duration_ms);
+        let target_origin = self.origin;
+        let logical_position = self.logical_position;
+        let now = Instant::now();
+
+        let frame =
+            window.with_element_namespace(("cursor_animation_editor", editor_id), |window| {
+                window.with_element_namespace(
+                    (
+                        "cursor_animation_replica",
+                        u32::from(key.replica_id.as_u16()),
+                    ),
+                    |window| {
+                        window.with_global_id(
+                            ("cursor_animation_selection", key.selection_id).into(),
+                            |global_id, window| {
+                                window.with_element_state::<CursorAnimationState, _>(
+                                    global_id,
+                                    |state, _| {
+                                        update_cursor_animation_state(
+                                            state,
+                                            logical_position,
+                                            target_origin,
+                                            now,
+                                            duration,
+                                            settings,
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )
+            });
+
+        self.origin = frame.origin;
+
+        if frame.shape_impulse > 0.0
+            && matches!(self.shape, CursorShape::Bar | CursorShape::Underline)
+        {
+            self.shape_width_scale = 1.0 + (settings.max_width_scale - 1.0) * frame.shape_impulse;
+            self.shape_height_scale = 1.0 - (1.0 - settings.min_height_scale) * frame.shape_impulse;
+        }
+
+        if frame.is_animating {
+            window.request_animation_frame();
         }
     }
 
@@ -13838,6 +14104,7 @@ mod tests {
             let spanning_selection = SelectionLayout {
                 head: DisplayPoint::new(DisplayRow(3), 7),
                 cursor_shape: CursorShape::Bar,
+                cursor_animation_key: None,
                 is_newest: true,
                 is_local: true,
                 range: DisplayPoint::new(DisplayRow(1), 5)..DisplayPoint::new(DisplayRow(3), 7),
@@ -13887,6 +14154,7 @@ mod tests {
             let selection = SelectionLayout {
                 head: DisplayPoint::new(DisplayRow(2), 0),
                 cursor_shape: CursorShape::Bar,
+                cursor_animation_key: None,
                 is_newest: true,
                 is_local: true,
                 range: DisplayPoint::new(DisplayRow(1), 5)..DisplayPoint::new(DisplayRow(3), 0),
@@ -14125,5 +14393,130 @@ mod tests {
             calculate_wrap_width(SoftWrap::Bounded(200), px(400.0), em_width),
             Some(px(400.0)),
         );
+    }
+
+    fn assert_pixels_near(actual: Pixels, expected: Pixels) {
+        assert!(
+            ((actual - expected) / px(1.0)).abs() < 0.001,
+            "expected {actual:?} to be near {expected:?}"
+        );
+    }
+
+    fn cursor_animation_test_settings() -> CursorAnimationSettings {
+        CursorAnimationSettings {
+            enabled: true,
+            movement: true,
+            shape: true,
+            duration_ms: 100,
+            min_height_scale: 0.5,
+            max_width_scale: 2.0,
+        }
+    }
+
+    #[test]
+    fn test_cursor_animation_delta_and_impulse() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+
+        assert_eq!(
+            cursor_animation_delta(started_at, Duration::ZERO, started_at),
+            1.0
+        );
+        assert_eq!(
+            cursor_animation_delta(started_at, duration, started_at + Duration::from_millis(50)),
+            0.5
+        );
+        assert_eq!(cursor_motion_delta(0.5), 0.875);
+        assert!((cursor_shape_impulse(0.5) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cursor_animation_restarts_from_current_origin() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let mid_animation = started_at + Duration::from_millis(50);
+        let old_position = DisplayPoint::new(DisplayRow(0), 0);
+        let new_position = DisplayPoint::new(DisplayRow(0), 1);
+        let state = CursorAnimationState {
+            logical_position: old_position,
+            start_origin: point(px(0.0), px(0.0)),
+            target_origin: point(px(100.0), px(0.0)),
+            started_at,
+            duration,
+        };
+
+        let (frame, state) = update_cursor_animation_state(
+            Some(state),
+            new_position,
+            point(px(200.0), px(0.0)),
+            mid_animation,
+            duration,
+            cursor_animation_test_settings(),
+        );
+
+        assert!(frame.is_animating);
+        assert_pixels_near(frame.origin.x, px(87.5));
+        assert_pixels_near(state.start_origin.x, px(87.5));
+        assert_pixels_near(state.target_origin.x, px(200.0));
+        assert_eq!(state.logical_position, new_position);
+    }
+
+    #[test]
+    fn test_cursor_animation_snaps_when_layout_moves_without_cursor_change() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let mid_animation = started_at + Duration::from_millis(50);
+        let position = DisplayPoint::new(DisplayRow(0), 0);
+        let state = CursorAnimationState {
+            logical_position: position,
+            start_origin: point(px(0.0), px(0.0)),
+            target_origin: point(px(100.0), px(0.0)),
+            started_at,
+            duration,
+        };
+
+        let (frame, state) = update_cursor_animation_state(
+            Some(state),
+            position,
+            point(px(60.0), px(0.0)),
+            mid_animation,
+            duration,
+            cursor_animation_test_settings(),
+        );
+
+        assert!(!frame.is_animating);
+        assert_pixels_near(frame.origin.x, px(60.0));
+        assert_pixels_near(state.target_origin.x, px(60.0));
+    }
+
+    #[test]
+    fn test_cursor_shape_animation_can_run_without_movement() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let old_position = DisplayPoint::new(DisplayRow(0), 0);
+        let new_position = DisplayPoint::new(DisplayRow(0), 1);
+        let state = CursorAnimationState {
+            logical_position: old_position,
+            start_origin: point(px(0.0), px(0.0)),
+            target_origin: point(px(100.0), px(0.0)),
+            started_at,
+            duration,
+        };
+        let settings = CursorAnimationSettings {
+            movement: false,
+            ..cursor_animation_test_settings()
+        };
+
+        let (frame, _) = update_cursor_animation_state(
+            Some(state),
+            new_position,
+            point(px(200.0), px(0.0)),
+            started_at + Duration::from_millis(50),
+            duration,
+            settings,
+        );
+
+        assert!(frame.is_animating);
+        assert_pixels_near(frame.origin.x, px(200.0));
     }
 }
