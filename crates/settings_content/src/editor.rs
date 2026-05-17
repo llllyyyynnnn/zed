@@ -824,7 +824,7 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: true
     pub movement: Option<bool>,
-    /// Whether the cursor shape changes during movement.
+    /// Whether line-like cursor shapes stretch during movement.
     ///
     /// Default: true
     pub shape: Option<bool>,
@@ -832,12 +832,12 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: 140
     pub duration_ms: Option<DelayMs>,
-    /// Minimum height scale for line-like cursors during movement.
+    /// Minimum height scale for stretched line-like cursors during movement.
     ///
     /// Default: 0.65
     #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
     pub min_height_scale: Option<f32>,
-    /// Maximum width scale for line-like cursors during movement.
+    /// Maximum width scale for the stretched cursor rectangle during movement.
     ///
     /// Default: 1.6
     #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]

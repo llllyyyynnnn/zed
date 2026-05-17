@@ -180,7 +180,7 @@ TBD: Centered layout related settings
   // Cursor shape for the default editor: bar, block, underline, hollow
   "cursor_shape": null,
 
-  // Optional editor cursor animation.
+  // Optional editor cursor movement and distance-based shape stretch animation.
   "cursor_animation": {
     "enabled": false,
     "movement": true,
