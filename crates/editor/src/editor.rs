@@ -44,6 +44,8 @@ mod selections_collection;
 pub mod semantic_tokens;
 mod split;
 pub mod split_editor_view;
+#[path = "ZedFX/cursor_animation.rs"]
+mod zedfx_cursor_animation;
 
 mod bookmarks;
 #[cfg(test)]
