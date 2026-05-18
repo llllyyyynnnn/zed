@@ -12613,7 +12613,6 @@ impl CursorLayout {
             let solid_bounds = self.shape_bounds_at(self.origin);
             trail.paint(
                 origin,
-                bounds,
                 window.pixel_snap_bounds(Bounds {
                     origin: solid_bounds.origin + origin,
                     size: solid_bounds.size,
