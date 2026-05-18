@@ -1983,8 +1983,7 @@ impl EditorElement {
                         line_height,
                         shape: selection.cursor_shape,
                         cursor_animation_key: selection.cursor_animation_key,
-                        shape_width: None,
-                        shape_height_scale: 1.0,
+                        shape_bounds: None,
                         block_text,
                         cursor_name: None,
                     };
@@ -12416,8 +12415,7 @@ pub struct CursorLayout {
     color: Hsla,
     shape: CursorShape,
     cursor_animation_key: Option<CursorAnimationKey>,
-    shape_width: Option<Pixels>,
-    shape_height_scale: f32,
+    shape_bounds: Option<Bounds<Pixels>>,
     block_text: Option<ShapedLine>,
     cursor_name: Option<AnyElement>,
 }
@@ -12436,13 +12434,13 @@ struct CursorAnimationState {
     target_origin: gpui::Point<Pixels>,
     started_at: Instant,
     duration: Duration,
-    shape_travel_scale: f32,
+    draw_trail: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CursorAnimationFrame {
     origin: gpui::Point<Pixels>,
-    shape_stretch: f32,
+    trail_origin: Option<gpui::Point<Pixels>>,
     is_animating: bool,
 }
 
@@ -12459,29 +12457,30 @@ impl CursorAnimationState {
             target_origin: origin,
             started_at,
             duration,
-            shape_travel_scale: 0.0,
+            draw_trail: false,
         }
     }
 
-    fn frame(
-        &self,
-        now: Instant,
-        movement_enabled: bool,
-        shape_enabled: bool,
-    ) -> CursorAnimationFrame {
+    fn frame(&self, now: Instant, movement_enabled: bool) -> CursorAnimationFrame {
         let delta = cursor_animation_delta(self.started_at, self.duration, now);
-        let motion_delta = cursor_motion_delta(delta);
+        let trail_origin = self.draw_trail.then(|| {
+            interpolate_point(
+                self.start_origin,
+                self.target_origin,
+                cursor_trail_delta(delta),
+            )
+        });
         CursorAnimationFrame {
-            origin: if movement_enabled {
-                interpolate_point(self.start_origin, self.target_origin, motion_delta)
+            origin: if movement_enabled && !self.draw_trail {
+                interpolate_point(
+                    self.start_origin,
+                    self.target_origin,
+                    cursor_motion_delta(delta),
+                )
             } else {
                 self.target_origin
             },
-            shape_stretch: if shape_enabled {
-                self.shape_travel_scale * cursor_shape_stretch(delta)
-            } else {
-                0.0
-            },
+            trail_origin,
             is_animating: delta < 1.0,
         }
     }
@@ -12510,21 +12509,8 @@ fn cursor_motion_delta(delta: f32) -> f32 {
     1.0 - (1.0 - delta).powi(3)
 }
 
-fn cursor_shape_stretch(delta: f32) -> f32 {
-    (1.0 - delta).clamp(0.0, 1.0)
-}
-
-fn cursor_shape_travel_scale(
-    start: gpui::Point<Pixels>,
-    end: gpui::Point<Pixels>,
-    reference_width: Pixels,
-) -> f32 {
-    let delta_x = ((end.x - start.x) / px(1.0)).abs();
-    let delta_y = ((end.y - start.y) / px(1.0)).abs();
-    let distance = (delta_x.powi(2) + delta_y.powi(2)).sqrt();
-    let reference_width = (reference_width / px(1.0)).max(1.0);
-
-    (distance / reference_width).clamp(0.0, 1.0)
+fn cursor_trail_delta(delta: f32) -> f32 {
+    delta.clamp(0.0, 1.0)
 }
 
 fn interpolate_point(
@@ -12542,20 +12528,51 @@ fn interpolate_pixels(start: Pixels, end: Pixels, delta: f32) -> Pixels {
     start + (end - start) * delta
 }
 
+fn union_bounds(first: Bounds<Pixels>, second: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::from_corners(
+        point(
+            first.left().min(second.left()),
+            first.top().min(second.top()),
+        ),
+        point(
+            first.right().max(second.right()),
+            first.bottom().max(second.bottom()),
+        ),
+    )
+}
+
+fn cursor_trail_allowed(
+    start: gpui::Point<Pixels>,
+    target: gpui::Point<Pixels>,
+    cursor_width: Pixels,
+    line_height: Pixels,
+    max_height_lines: f32,
+) -> bool {
+    let delta_x = (target.x - start.x).abs();
+    let delta_y = (target.y - start.y).abs();
+    let trail_height = delta_y + line_height;
+    let max_trail_height = line_height * max_height_lines;
+    let diagonal = delta_x > cursor_width.max(px(2.0)) && delta_y > Pixels::ZERO;
+
+    !diagonal && trail_height <= max_trail_height
+}
+
 fn update_cursor_animation_state(
     state: Option<CursorAnimationState>,
     logical_position: DisplayPoint,
     target_origin: gpui::Point<Pixels>,
     now: Instant,
     duration: Duration,
-    shape_reference_width: Pixels,
     settings: CursorAnimationSettings,
+    trail_enabled: bool,
+    cursor_width: Pixels,
+    line_height: Pixels,
 ) -> (CursorAnimationFrame, CursorAnimationState) {
     let Some(mut state) = state else {
         return (
             CursorAnimationFrame {
                 origin: target_origin,
-                shape_stretch: 0.0,
+                trail_origin: None,
                 is_animating: false,
             },
             CursorAnimationState::settled(logical_position, target_origin, now, duration),
@@ -12563,27 +12580,29 @@ fn update_cursor_animation_state(
     };
 
     if state.logical_position != logical_position {
-        let current = state.frame(now, settings.movement, settings.shape);
-        let shape_start_origin = if settings.movement {
+        let current = state.frame(now, settings.movement);
+        let start_origin = if state.draw_trail {
+            current.trail_origin.unwrap_or(current.origin)
+        } else if settings.movement || trail_enabled {
             current.origin
         } else {
-            state.target_origin
+            target_origin
         };
+        let draw_trail = trail_enabled
+            && cursor_trail_allowed(
+                start_origin,
+                target_origin,
+                cursor_width,
+                line_height,
+                settings.max_trail_height_lines,
+            );
         state = CursorAnimationState {
             logical_position,
-            start_origin: if settings.movement {
-                current.origin
-            } else {
-                target_origin
-            },
+            start_origin,
             target_origin,
             started_at: now,
             duration,
-            shape_travel_scale: cursor_shape_travel_scale(
-                shape_start_origin,
-                target_origin,
-                shape_reference_width,
-            ),
+            draw_trail,
         };
     } else if state.target_origin != target_origin {
         state = CursorAnimationState::settled(logical_position, target_origin, now, duration);
@@ -12591,14 +12610,14 @@ fn update_cursor_animation_state(
         state.duration = duration;
     }
 
-    let frame = state.frame(now, settings.movement, settings.shape);
+    let frame = state.frame(now, settings.movement);
     if frame.is_animating {
         (frame, state)
     } else {
         (
             CursorAnimationFrame {
                 origin: target_origin,
-                shape_stretch: 0.0,
+                trail_origin: None,
                 is_animating: false,
             },
             CursorAnimationState::settled(logical_position, target_origin, now, duration),
@@ -12623,47 +12642,57 @@ impl CursorLayout {
             color,
             shape,
             cursor_animation_key: None,
-            shape_width: None,
-            shape_height_scale: 1.0,
+            shape_bounds: None,
             block_text,
             cursor_name: None,
         }
     }
 
     pub fn bounding_rect(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
-        Bounds {
-            origin: self.origin + origin,
-            size: size(self.block_width, self.line_height),
-        }
+        self.bounds(origin)
     }
 
     fn bounds(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
+        if let Some(bounds) = self.shape_bounds {
+            return Bounds {
+                origin: bounds.origin + origin,
+                size: bounds.size,
+            };
+        }
+
+        let bounds = self.shape_bounds_at(self.origin);
+        Bounds {
+            origin: bounds.origin + origin,
+            size: bounds.size,
+        }
+    }
+
+    fn shape_bounds_at(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
         match self.shape {
-            CursorShape::Bar => {
-                let width = self.shape_width.unwrap_or(px(2.0));
-                let height = self.line_height * self.shape_height_scale;
-                Bounds {
-                    origin: self.origin
-                        + origin
-                        + point((px(2.0) - width) / 2., (self.line_height - height) / 2.),
-                    size: size(width, height),
-                }
-            }
+            CursorShape::Bar => Bounds {
+                origin,
+                size: size(px(2.0), self.line_height),
+            },
             CursorShape::Block | CursorShape::Hollow => Bounds {
-                origin: self.origin + origin,
+                origin,
                 size: size(self.block_width, self.line_height),
             },
-            CursorShape::Underline => {
-                let width = self.shape_width.unwrap_or(self.block_width);
-                let height = px(2.0) * self.shape_height_scale;
-                Bounds {
-                    origin: self.origin
-                        + origin
-                        + point((self.block_width - width) / 2., self.line_height - height),
-                    size: size(width, height),
-                }
-            }
+            CursorShape::Underline => Bounds {
+                origin: origin + point(Pixels::ZERO, self.line_height - px(2.0)),
+                size: size(self.block_width, px(2.0)),
+            },
         }
+    }
+
+    fn trail_bounds_between(
+        &self,
+        trail_origin: gpui::Point<Pixels>,
+        target_origin: gpui::Point<Pixels>,
+    ) -> Bounds<Pixels> {
+        union_bounds(
+            self.shape_bounds_at(trail_origin),
+            self.shape_bounds_at(target_origin),
+        )
     }
 
     fn apply_animation(
@@ -12683,7 +12712,9 @@ impl CursorLayout {
         let duration = Duration::from_millis(settings.duration_ms);
         let target_origin = self.origin;
         let logical_position = self.logical_position;
-        let shape_reference_width = self.block_width;
+        let trail_enabled =
+            settings.shape && matches!(self.shape, CursorShape::Bar | CursorShape::Underline);
+        let trail_cursor_width = self.shape_bounds_at(target_origin).size.width;
         let now = Instant::now();
 
         let frame =
@@ -12706,8 +12737,10 @@ impl CursorLayout {
                                             target_origin,
                                             now,
                                             duration,
-                                            shape_reference_width,
                                             settings,
+                                            trail_enabled,
+                                            trail_cursor_width,
+                                            self.line_height,
                                         )
                                     },
                                 )
@@ -12719,25 +12752,10 @@ impl CursorLayout {
 
         self.origin = frame.origin;
 
-        if frame.shape_stretch > 0.0
-            && matches!(self.shape, CursorShape::Bar | CursorShape::Underline)
+        if let Some(trail_origin) = frame.trail_origin
+            && trail_origin != target_origin
         {
-            self.shape_height_scale = 1.0 - (1.0 - settings.min_height_scale) * frame.shape_stretch;
-            match self.shape {
-                CursorShape::Bar => {
-                    let line_width = px(2.0);
-                    let max_width = (self.block_width * settings.max_width_scale).max(line_width);
-                    self.shape_width =
-                        Some(line_width + (max_width - line_width) * frame.shape_stretch);
-                }
-                CursorShape::Underline => {
-                    let max_width = self.block_width * settings.max_width_scale;
-                    self.shape_width = Some(
-                        self.block_width + (max_width - self.block_width) * frame.shape_stretch,
-                    );
-                }
-                CursorShape::Block | CursorShape::Hollow => {}
-            }
+            self.shape_bounds = Some(self.trail_bounds_between(trail_origin, target_origin));
         }
 
         if frame.is_animating {
@@ -12753,7 +12771,11 @@ impl CursorLayout {
         cx: &mut App,
     ) {
         if let Some(cursor_name) = cursor_name {
-            let bounds = self.bounds(origin);
+            let cursor_bounds = self.shape_bounds_at(self.origin);
+            let bounds = Bounds {
+                origin: cursor_bounds.origin + origin,
+                size: cursor_bounds.size,
+            };
             let text_size = self.line_height / 1.5;
 
             let name_origin = if cursor_name.is_top_row {
@@ -14463,13 +14485,12 @@ mod tests {
             movement: true,
             shape: true,
             duration_ms: 100,
-            min_height_scale: 0.5,
-            max_width_scale: 2.0,
+            max_trail_height_lines: 2.0,
         }
     }
 
     #[test]
-    fn test_cursor_animation_delta_and_shape_stretch() {
+    fn test_cursor_animation_delta_and_trail_delta() {
         let started_at = Instant::now();
         let duration = Duration::from_millis(100);
 
@@ -14482,17 +14503,9 @@ mod tests {
             0.5
         );
         assert_eq!(cursor_motion_delta(0.5), 0.875);
-        assert_eq!(cursor_shape_stretch(0.0), 1.0);
-        assert_eq!(cursor_shape_stretch(0.5), 0.5);
-        assert_eq!(cursor_shape_stretch(1.0), 0.0);
-        assert_eq!(
-            cursor_shape_travel_scale(point(px(0.0), px(0.0)), point(px(5.0), px(0.0)), px(10.0)),
-            0.5
-        );
-        assert_eq!(
-            cursor_shape_travel_scale(point(px(0.0), px(0.0)), point(px(20.0), px(0.0)), px(10.0)),
-            1.0
-        );
+        assert_eq!(cursor_trail_delta(0.0), 0.0);
+        assert_eq!(cursor_trail_delta(0.5), 0.5);
+        assert_eq!(cursor_trail_delta(1.0), 1.0);
     }
 
     #[test]
@@ -14524,7 +14537,7 @@ mod tests {
             target_origin: point(px(100.0), px(0.0)),
             started_at,
             duration,
-            shape_travel_scale: 1.0,
+            draw_trail: true,
         };
 
         let (frame, state) = update_cursor_animation_state(
@@ -14533,14 +14546,16 @@ mod tests {
             point(px(200.0), px(0.0)),
             mid_animation,
             duration,
-            px(10.0),
             cursor_animation_test_settings(),
+            true,
+            px(10.0),
+            px(20.0),
         );
 
         assert!(frame.is_animating);
-        assert_pixels_near(frame.origin.x, px(87.5));
-        assert_eq!(frame.shape_stretch, 1.0);
-        assert_pixels_near(state.start_origin.x, px(87.5));
+        assert_pixels_near(frame.origin.x, px(200.0));
+        assert_eq!(frame.trail_origin, Some(point(px(50.0), px(0.0))));
+        assert_pixels_near(state.start_origin.x, px(50.0));
         assert_pixels_near(state.target_origin.x, px(200.0));
         assert_eq!(state.logical_position, new_position);
     }
@@ -14557,7 +14572,7 @@ mod tests {
             target_origin: point(px(100.0), px(0.0)),
             started_at,
             duration,
-            shape_travel_scale: 1.0,
+            draw_trail: true,
         };
 
         let (frame, state) = update_cursor_animation_state(
@@ -14566,14 +14581,174 @@ mod tests {
             point(px(60.0), px(0.0)),
             mid_animation,
             duration,
-            px(10.0),
             cursor_animation_test_settings(),
+            true,
+            px(10.0),
+            px(20.0),
         );
 
         assert!(!frame.is_animating);
         assert_pixels_near(frame.origin.x, px(60.0));
-        assert_eq!(frame.shape_stretch, 0.0);
+        assert_eq!(frame.trail_origin, None);
         assert_pixels_near(state.target_origin.x, px(60.0));
+    }
+
+    #[test]
+    fn test_cursor_trail_bounds_do_not_overshoot_endpoints() {
+        let cursor = CursorLayout::new(
+            point(px(0.0), px(0.0)),
+            px(10.0),
+            px(20.0),
+            Hsla::default(),
+            CursorShape::Bar,
+            None,
+        );
+        let horizontal_bounds =
+            cursor.trail_bounds_between(point(px(100.0), px(0.0)), point(px(80.0), px(0.0)));
+
+        assert_pixels_near(horizontal_bounds.left(), px(80.0));
+        assert_pixels_near(horizontal_bounds.right(), px(102.0));
+        assert_pixels_near(horizontal_bounds.top(), px(0.0));
+        assert_pixels_near(horizontal_bounds.bottom(), px(20.0));
+
+        let vertical_bounds =
+            cursor.trail_bounds_between(point(px(0.0), px(0.0)), point(px(0.0), px(100.0)));
+        assert_pixels_near(vertical_bounds.left(), px(0.0));
+        assert_pixels_near(vertical_bounds.right(), px(2.0));
+        assert_pixels_near(vertical_bounds.top(), px(0.0));
+        assert_pixels_near(vertical_bounds.bottom(), px(120.0));
+    }
+
+    #[test]
+    fn test_cursor_trail_rejects_bar_width_diagonal() {
+        assert!(cursor_trail_allowed(
+            point(px(0.0), px(0.0)),
+            point(px(0.0), px(20.0)),
+            px(2.0),
+            px(20.0),
+            2.0,
+        ));
+        assert!(cursor_trail_allowed(
+            point(px(0.0), px(0.0)),
+            point(px(500.0), px(0.0)),
+            px(2.0),
+            px(20.0),
+            2.0,
+        ));
+        assert!(!cursor_trail_allowed(
+            point(px(0.0), px(0.0)),
+            point(px(5.0), px(20.0)),
+            px(2.0),
+            px(20.0),
+            2.0,
+        ));
+    }
+
+    #[test]
+    fn test_vertical_cursor_shape_animation_changes_height_not_width() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let old_position = DisplayPoint::new(DisplayRow(0), 0);
+        let new_position = DisplayPoint::new(DisplayRow(1), 0);
+        let state = CursorAnimationState::settled(
+            old_position,
+            point(px(0.0), px(0.0)),
+            started_at,
+            duration,
+        );
+
+        let (frame, state) = update_cursor_animation_state(
+            Some(state),
+            new_position,
+            point(px(0.0), px(100.0)),
+            started_at,
+            duration,
+            cursor_animation_test_settings(),
+            true,
+            px(10.0),
+            px(100.0),
+        );
+
+        assert!(frame.is_animating);
+        assert_pixels_near(frame.origin.x, px(0.0));
+        assert_pixels_near(frame.origin.y, px(100.0));
+        assert_eq!(frame.trail_origin, Some(point(px(0.0), px(0.0))));
+
+        let frame = state.frame(
+            started_at + Duration::from_millis(50),
+            cursor_animation_test_settings().movement,
+        );
+        assert_eq!(frame.trail_origin, Some(point(px(0.0), px(50.0))));
+    }
+
+    #[test]
+    fn test_diagonal_cursor_shape_animation_falls_back_to_movement() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let old_position = DisplayPoint::new(DisplayRow(0), 10);
+        let new_position = DisplayPoint::new(DisplayRow(1), 0);
+        let state = CursorAnimationState::settled(
+            old_position,
+            point(px(100.0), px(0.0)),
+            started_at,
+            duration,
+        );
+
+        let (frame, state) = update_cursor_animation_state(
+            Some(state),
+            new_position,
+            point(px(0.0), px(100.0)),
+            started_at,
+            duration,
+            cursor_animation_test_settings(),
+            true,
+            px(10.0),
+            px(100.0),
+        );
+
+        assert!(frame.is_animating);
+        assert_eq!(frame.trail_origin, None);
+        assert_pixels_near(frame.origin.x, px(100.0));
+        assert_pixels_near(frame.origin.y, px(0.0));
+        assert!(!state.draw_trail);
+
+        let frame = state.frame(
+            started_at + Duration::from_millis(50),
+            cursor_animation_test_settings().movement,
+        );
+        assert_eq!(frame.trail_origin, None);
+        assert_pixels_near(frame.origin.x, px(12.5));
+        assert_pixels_near(frame.origin.y, px(87.5));
+    }
+
+    #[test]
+    fn test_tall_cursor_shape_animation_falls_back_to_movement() {
+        let started_at = Instant::now();
+        let duration = Duration::from_millis(100);
+        let old_position = DisplayPoint::new(DisplayRow(0), 0);
+        let new_position = DisplayPoint::new(DisplayRow(3), 0);
+        let state = CursorAnimationState::settled(
+            old_position,
+            point(px(0.0), px(0.0)),
+            started_at,
+            duration,
+        );
+
+        let (frame, state) = update_cursor_animation_state(
+            Some(state),
+            new_position,
+            point(px(0.0), px(300.0)),
+            started_at,
+            duration,
+            cursor_animation_test_settings(),
+            true,
+            px(10.0),
+            px(100.0),
+        );
+
+        assert!(frame.is_animating);
+        assert_eq!(frame.trail_origin, None);
+        assert!(!state.draw_trail);
     }
 
     #[test]
@@ -14588,25 +14763,30 @@ mod tests {
             target_origin: point(px(100.0), px(0.0)),
             started_at,
             duration,
-            shape_travel_scale: 0.0,
+            draw_trail: false,
         };
         let settings = CursorAnimationSettings {
             movement: false,
             ..cursor_animation_test_settings()
         };
 
-        let (frame, _) = update_cursor_animation_state(
+        let (frame, state) = update_cursor_animation_state(
             Some(state),
             new_position,
             point(px(200.0), px(0.0)),
             started_at + Duration::from_millis(50),
             duration,
-            px(100.0),
             settings,
+            true,
+            px(10.0),
+            px(20.0),
         );
 
         assert!(frame.is_animating);
         assert_pixels_near(frame.origin.x, px(200.0));
-        assert_eq!(frame.shape_stretch, 1.0);
+        assert_eq!(frame.trail_origin, Some(point(px(100.0), px(0.0))));
+
+        let frame = state.frame(started_at + Duration::from_millis(100), settings.movement);
+        assert_eq!(frame.trail_origin, Some(point(px(150.0), px(0.0))));
     }
 }

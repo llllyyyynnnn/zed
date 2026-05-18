@@ -236,14 +236,12 @@
     "enabled": false,
     // Whether the cursor animates between positions.
     "movement": true,
-    // Whether line-like cursor shapes stretch during movement.
+    // Whether line-like cursor shapes leave a bounded trail during movement.
     "shape": true,
     // Cursor animation duration in milliseconds.
     "duration_ms": 140,
-    // Minimum height scale for stretched line-like cursors during movement.
-    "min_height_scale": 0.65,
-    // Maximum width scale for the stretched cursor rectangle during movement.
-    "max_width_scale": 1.6
+    // Maximum cursor trail height, measured in line heights.
+    "max_trail_height_lines": 2.0
   },
   // Determines when the mouse cursor should be hidden in response to keyboard
   // input.

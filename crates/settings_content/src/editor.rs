@@ -8,7 +8,6 @@ use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{
     DelayMs, DiagnosticSeverityContent, ShowScrollbar, serialize_f32_with_two_decimal_places,
-    serialize_optional_f32_with_two_decimal_places,
 };
 
 #[with_fallible_options]
@@ -25,7 +24,7 @@ pub struct EditorSettingsContent {
     pub cursor_shape: Option<CursorShape>,
     /// Controls optional editor cursor animation.
     ///
-    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "min_height_scale": 0.65, "max_width_scale": 1.6 }
+    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "max_trail_height_lines": 2.0 }
     pub cursor_animation: Option<CursorAnimationSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
@@ -824,7 +823,7 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: true
     pub movement: Option<bool>,
-    /// Whether line-like cursor shapes stretch during movement.
+    /// Whether line-like cursor shapes leave a bounded trail during movement.
     ///
     /// Default: true
     pub shape: Option<bool>,
@@ -832,16 +831,11 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: 140
     pub duration_ms: Option<DelayMs>,
-    /// Minimum height scale for stretched line-like cursors during movement.
+    /// Maximum cursor trail height, measured in line heights.
     ///
-    /// Default: 0.65
-    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
-    pub min_height_scale: Option<f32>,
-    /// Maximum width scale for the stretched cursor rectangle during movement.
-    ///
-    /// Default: 1.6
-    #[serde(serialize_with = "serialize_optional_f32_with_two_decimal_places")]
-    pub max_width_scale: Option<f32>,
+    /// Default: 2.0
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub max_trail_height_lines: Option<f32>,
 }
 
 /// What to do when go to definition yields no results.
