@@ -1,14 +1,18 @@
 use crate::{
-    DisplayPoint, EditorSnapshot, RowExt,
+    DisplayPoint, DisplayRow, EditorSnapshot, RowExt,
     editor_settings::CursorAnimationSettings,
     movement::TextLayoutDetails,
     scroll::{ScrollOffset, ScrollPixelOffset},
 };
 use clock::ReplicaId;
+use collections::{HashMap, HashSet};
 use gpui::{
     Bounds, Hsla, Pixels, TextAlign, Window, fill, linear_color_stop, linear_gradient, point, px,
 };
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 const TRAIL_FADE_START: f32 = 0.0;
 const TRAIL_FADE_END: f32 = 1.0;
@@ -21,6 +25,159 @@ type TrailPolygon = [gpui::Point<Pixels>; TRAIL_POLYGON_POINTS];
 pub(crate) struct CursorAnimationKey {
     pub(crate) replica_id: ReplicaId,
     pub(crate) selection_id: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct CursorAnimationStates {
+    states: HashMap<CursorAnimationKey, CursorAnimationState>,
+    active_keys: HashSet<CursorAnimationKey>,
+}
+
+impl CursorAnimationStates {
+    pub(crate) fn sync_hidden_selections(
+        &mut self,
+        selections: impl IntoIterator<Item = CursorAnimationSelection>,
+        viewport: &CursorAnimationViewport<'_>,
+        frame_context: CursorAnimationFrameContext,
+    ) {
+        if !frame_context.is_active() {
+            return;
+        }
+
+        for selection in selections {
+            if viewport.is_visible(selection.position) {
+                continue;
+            }
+
+            let origin = viewport.origin_for_display_point(selection.position);
+            self.sync_hidden(selection.key, selection.position, origin, frame_context);
+        }
+    }
+
+    pub(crate) fn update_visible(
+        &mut self,
+        key: Option<CursorAnimationKey>,
+        logical_position: DisplayPoint,
+        target_origin: gpui::Point<Pixels>,
+        frame_context: CursorAnimationFrameContext,
+        trail_enabled: bool,
+    ) -> Option<CursorAnimationFrame> {
+        let key = key?;
+        self.active_keys.insert(key);
+        let state = self.states.remove(&key);
+        let (frame, state) = CursorAnimationState::update(
+            state,
+            logical_position,
+            target_origin,
+            frame_context,
+            trail_enabled,
+        );
+        self.states.insert(key, state);
+        Some(frame)
+    }
+
+    fn sync_hidden(
+        &mut self,
+        key: Option<CursorAnimationKey>,
+        logical_position: DisplayPoint,
+        origin: gpui::Point<Pixels>,
+        frame_context: CursorAnimationFrameContext,
+    ) {
+        let Some(key) = key else {
+            return;
+        };
+
+        self.active_keys.insert(key);
+        self.states.insert(
+            key,
+            CursorAnimationState::settled(logical_position, origin, frame_context),
+        );
+    }
+
+    pub(crate) fn finish_frame(&mut self, frame_context: CursorAnimationFrameContext) {
+        if frame_context.is_active() {
+            self.states.retain(|key, _| self.active_keys.contains(key));
+            self.active_keys.clear();
+        } else {
+            self.states.clear();
+            self.active_keys.clear();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CursorAnimationFrameContext {
+    settings: CursorAnimationSettings,
+    now: Instant,
+    duration: Duration,
+}
+
+impl CursorAnimationFrameContext {
+    pub(crate) fn new(settings: CursorAnimationSettings) -> Self {
+        Self::at(settings, Instant::now())
+    }
+
+    fn at(settings: CursorAnimationSettings, now: Instant) -> Self {
+        Self {
+            settings,
+            now,
+            duration: Duration::from_millis(settings.duration_ms),
+        }
+    }
+
+    pub(crate) fn settings(&self) -> CursorAnimationSettings {
+        self.settings
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.settings.is_active()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CursorAnimationSelection {
+    key: Option<CursorAnimationKey>,
+    position: DisplayPoint,
+}
+
+impl CursorAnimationSelection {
+    pub(crate) fn new(key: Option<CursorAnimationKey>, position: DisplayPoint) -> Self {
+        Self { key, position }
+    }
+}
+
+pub(crate) struct CursorAnimationViewport<'a> {
+    pub(crate) snapshot: &'a EditorSnapshot,
+    pub(crate) text_layout_details: &'a TextLayoutDetails,
+    pub(crate) row_block_types: &'a HashMap<DisplayRow, bool>,
+    pub(crate) visible_rows: Range<DisplayRow>,
+    pub(crate) show_local_cursors: bool,
+    pub(crate) text_align: TextAlign,
+    pub(crate) content_width: Pixels,
+    pub(crate) scroll_position: gpui::Point<ScrollOffset>,
+    pub(crate) scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+    pub(crate) line_height: Pixels,
+}
+
+impl CursorAnimationViewport<'_> {
+    fn is_visible(&self, position: DisplayPoint) -> bool {
+        self.show_local_cursors
+            && self.visible_rows.contains(&position.row())
+            && self.row_block_types.get(&position.row()) != Some(&true)
+    }
+
+    fn origin_for_display_point(&self, position: DisplayPoint) -> gpui::Point<Pixels> {
+        cursor_origin_for_display_point(
+            self.snapshot,
+            position,
+            self.text_layout_details,
+            self.text_align,
+            self.content_width,
+            self.scroll_position,
+            self.scroll_pixel_position,
+            self.line_height,
+        )
+    }
 }
 
 impl CursorAnimationKey {
@@ -44,7 +201,7 @@ impl CursorAnimationKey {
     }
 }
 
-pub(crate) fn cursor_origin_for_display_point(
+fn cursor_origin_for_display_point(
     snapshot: &EditorSnapshot,
     cursor_position: DisplayPoint,
     text_layout_details: &TextLayoutDetails,
@@ -112,14 +269,16 @@ impl CursorAnimationState {
         }
     }
 
-    pub(crate) fn settled(
+    fn settled(
         logical_position: DisplayPoint,
         origin: gpui::Point<Pixels>,
-        now: Instant,
-        duration: Duration,
+        frame_context: CursorAnimationFrameContext,
     ) -> Self {
-        let started_at = now.checked_sub(duration).unwrap_or(now);
-        Self::new(logical_position, origin, started_at, duration)
+        let started_at = frame_context
+            .now
+            .checked_sub(frame_context.duration)
+            .unwrap_or(frame_context.now);
+        Self::new(logical_position, origin, started_at, frame_context.duration)
     }
 
     fn frame(&self, now: Instant, movement_enabled: bool) -> CursorAnimationFrame {
@@ -144,9 +303,7 @@ impl CursorAnimationState {
         state: Option<Self>,
         logical_position: DisplayPoint,
         target_origin: gpui::Point<Pixels>,
-        now: Instant,
-        duration: Duration,
-        settings: CursorAnimationSettings,
+        frame_context: CursorAnimationFrameContext,
         trail_enabled: bool,
     ) -> (CursorAnimationFrame, Self) {
         let Some(mut state) = state else {
@@ -156,15 +313,15 @@ impl CursorAnimationState {
                     trail_origin: None,
                     is_animating: false,
                 },
-                Self::settled(logical_position, target_origin, now, duration),
+                Self::settled(logical_position, target_origin, frame_context),
             );
         };
 
         if state.logical_position != logical_position {
-            let current = state.frame(now, settings.movement);
+            let current = state.frame(frame_context.now, frame_context.settings.movement);
             let start_origin = if state.draw_trail {
                 current.trail_origin.unwrap_or(current.origin)
-            } else if settings.movement || trail_enabled {
+            } else if frame_context.settings.movement || trail_enabled {
                 current.origin
             } else {
                 target_origin
@@ -173,17 +330,17 @@ impl CursorAnimationState {
                 logical_position,
                 start_origin,
                 target_origin,
-                started_at: now,
-                duration,
+                started_at: frame_context.now,
+                duration: frame_context.duration,
                 draw_trail: trail_enabled,
             };
         } else if state.target_origin != target_origin {
-            state = Self::settled(logical_position, target_origin, now, duration);
-        } else if state.duration != duration {
-            state.duration = duration;
+            state = Self::settled(logical_position, target_origin, frame_context);
+        } else if state.duration != frame_context.duration {
+            state.duration = frame_context.duration;
         }
 
-        let frame = state.frame(now, settings.movement);
+        let frame = state.frame(frame_context.now, frame_context.settings.movement);
         if frame.is_animating {
             (frame, state)
         } else {
@@ -193,7 +350,7 @@ impl CursorAnimationState {
                     trail_origin: None,
                     is_animating: false,
                 },
-                Self::settled(logical_position, target_origin, now, duration),
+                Self::settled(logical_position, target_origin, frame_context),
             )
         }
     }

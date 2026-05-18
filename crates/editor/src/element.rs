@@ -17,9 +17,9 @@ use crate::{
         HighlightKey, HighlightedChunk, ToDisplayPoint,
     },
     editor_settings::{
-        CurrentLineHighlight, CursorAnimationSettings, DocumentColorsRenderMode,
-        DoubleClickInMultibuffer, Minimap, MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine,
-        ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
+        CurrentLineHighlight, DocumentColorsRenderMode, DoubleClickInMultibuffer, Minimap,
+        MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes,
+        ScrollbarDiagnostics, ShowMinimap,
     },
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
@@ -33,7 +33,8 @@ use crate::{
         scroll_amount::ScrollAmount,
     },
     zedfx_cursor_animation::{
-        CursorAnimationKey, CursorAnimationState, CursorShapeTrail, cursor_origin_for_display_point,
+        CursorAnimationFrameContext, CursorAnimationKey, CursorAnimationSelection,
+        CursorAnimationStates, CursorAnimationViewport, CursorShapeTrail,
     },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
@@ -193,6 +194,37 @@ impl SelectionLayout {
             user_name,
         }
     }
+
+    fn cursor_animation_selection(&self) -> CursorAnimationSelection {
+        CursorAnimationSelection::new(self.cursor_animation_key, self.head)
+    }
+}
+
+fn local_cursor_animation_selections(
+    editor: &Editor,
+    snapshot: &EditorSnapshot,
+) -> Vec<CursorAnimationSelection> {
+    let newest_selection_id = editor.selections.newest_anchor().id;
+    editor
+        .selections
+        .all::<Point>(&snapshot.display_snapshot)
+        .into_iter()
+        .map(|selection| {
+            let is_newest = selection.id == newest_selection_id;
+            SelectionLayout::new(
+                selection,
+                editor.selections.line_mode(),
+                editor.cursor_offset_on_selection,
+                editor.cursor_shape,
+                Some(ReplicaId::LOCAL),
+                &snapshot.display_snapshot,
+                is_newest,
+                editor.leader_id.is_none(),
+                None,
+            )
+            .cursor_animation_selection()
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -1818,57 +1850,27 @@ impl EditorElement {
             let mut cursors = Vec::new();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
-            let cursor_animation_settings = EditorSettings::get_global(cx).cursor_animation;
-            let mut active_cursor_animation_keys = HashSet::default();
-            if cursor_animation_settings.is_active() {
+            let cursor_animation_context =
+                CursorAnimationFrameContext::new(EditorSettings::get_global(cx).cursor_animation);
+            if cursor_animation_context.is_active() {
                 let text_layout_details = editor.text_layout_details(window, cx);
-                let newest_selection_id = editor.selections.newest_anchor().id;
-
-                for selection in editor.selections.all::<Point>(&snapshot.display_snapshot) {
-                    let is_newest = selection.id == newest_selection_id;
-                    let selection = SelectionLayout::new(
-                        selection,
-                        editor.selections.line_mode(),
-                        editor.cursor_offset_on_selection,
-                        editor.cursor_shape,
-                        Some(ReplicaId::LOCAL),
-                        &snapshot.display_snapshot,
-                        is_newest,
-                        editor.leader_id.is_none(),
-                        None,
-                    );
-                    let cursor_position = selection.head;
-                    let cursor_is_visible = show_local_cursors
-                        && visible_display_row_range.contains(&cursor_position.row())
-                        && row_block_types.get(&cursor_position.row()) != Some(&true);
-                    if cursor_is_visible {
-                        if let Some(key) = selection.cursor_animation_key {
-                            active_cursor_animation_keys.insert(key);
-                        }
-                        continue;
-                    }
-
-                    let origin = cursor_origin_for_display_point(
-                        snapshot,
-                        cursor_position,
-                        &text_layout_details,
-                        self.style.text.text_align,
-                        text_hitbox.size.width,
-                        scroll_position,
-                        scroll_pixel_position,
-                        line_height,
-                    );
-                    if let Some(key) = selection.cursor_animation_key {
-                        active_cursor_animation_keys.insert(key);
-                    }
-                    CursorLayout::sync_hidden_animation_state(
-                        &mut editor.cursor_animation_states,
-                        selection.cursor_animation_key,
-                        cursor_position,
-                        origin,
-                        cursor_animation_settings,
-                    );
-                }
+                let viewport = CursorAnimationViewport {
+                    snapshot,
+                    text_layout_details: &text_layout_details,
+                    row_block_types,
+                    visible_rows: visible_display_row_range.clone(),
+                    show_local_cursors,
+                    text_align: self.style.text.text_align,
+                    content_width: text_hitbox.size.width,
+                    scroll_position,
+                    scroll_pixel_position,
+                    line_height,
+                };
+                editor.cursor_animation_states.sync_hidden_selections(
+                    local_cursor_animation_selections(editor, snapshot),
+                    &viewport,
+                    cursor_animation_context,
+                );
             }
 
             for (player_color, selections) in selections {
@@ -2019,12 +2021,9 @@ impl EditorElement {
                         color: self.style.background,
                         is_top_row: cursor_position.row().0 == 0,
                     });
-                    if let Some(key) = cursor.cursor_animation_key {
-                        active_cursor_animation_keys.insert(key);
-                    }
                     cursor.apply_animation(
                         &mut editor.cursor_animation_states,
-                        cursor_animation_settings,
+                        cursor_animation_context,
                         window,
                     );
                     cursor.layout(content_origin, cursor_name, window, cx);
@@ -2032,13 +2031,9 @@ impl EditorElement {
                 }
             }
 
-            if cursor_animation_settings.is_active() {
-                editor
-                    .cursor_animation_states
-                    .retain(|key, _| active_cursor_animation_keys.contains(key));
-            } else {
-                editor.cursor_animation_states.clear();
-            }
+            editor
+                .cursor_animation_states
+                .finish_frame(cursor_animation_context);
 
             cursors
         });
@@ -12531,35 +12526,29 @@ impl CursorLayout {
 
     fn apply_animation(
         &mut self,
-        cursor_animation_states: &mut HashMap<CursorAnimationKey, CursorAnimationState>,
-        settings: CursorAnimationSettings,
+        cursor_animation_states: &mut CursorAnimationStates,
+        frame_context: CursorAnimationFrameContext,
         window: &mut Window,
     ) {
+        let settings = frame_context.settings();
         if !settings.is_active() {
             return;
         }
 
-        let duration = Duration::from_millis(settings.duration_ms);
         let target_origin = self.origin;
         let logical_position = self.logical_position;
         let trail_enabled =
             settings.shape && matches!(self.shape, CursorShape::Bar | CursorShape::Underline);
-        let now = Instant::now();
 
-        let Some(key) = self.cursor_animation_key else {
-            return;
-        };
-        let state = cursor_animation_states.remove(&key);
-        let (frame, state) = CursorAnimationState::update(
-            state,
+        let Some(frame) = cursor_animation_states.update_visible(
+            self.cursor_animation_key,
             logical_position,
             target_origin,
-            now,
-            duration,
-            settings,
+            frame_context,
             trail_enabled,
-        );
-        cursor_animation_states.insert(key, state);
+        ) else {
+            return;
+        };
 
         self.origin = frame.origin;
 
@@ -12577,28 +12566,6 @@ impl CursorLayout {
         if frame.is_animating {
             window.request_animation_frame();
         }
-    }
-
-    fn sync_hidden_animation_state(
-        cursor_animation_states: &mut HashMap<CursorAnimationKey, CursorAnimationState>,
-        cursor_animation_key: Option<CursorAnimationKey>,
-        logical_position: DisplayPoint,
-        origin: gpui::Point<Pixels>,
-        settings: CursorAnimationSettings,
-    ) {
-        if !settings.is_active() {
-            return;
-        }
-
-        let duration = Duration::from_millis(settings.duration_ms);
-        let now = Instant::now();
-        let Some(key) = cursor_animation_key else {
-            return;
-        };
-        cursor_animation_states.insert(
-            key,
-            CursorAnimationState::settled(logical_position, origin, now, duration),
-        );
     }
 
     pub fn layout(

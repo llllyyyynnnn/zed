@@ -18,6 +18,13 @@ fn cursor_animation_test_settings() -> CursorAnimationSettings {
     }
 }
 
+fn cursor_animation_frame_context(
+    settings: CursorAnimationSettings,
+    now: Instant,
+) -> CursorAnimationFrameContext {
+    CursorAnimationFrameContext::at(settings, now)
+}
+
 fn bar_bounds(origin: gpui::Point<Pixels>, line_height: Pixels) -> Bounds<Pixels> {
     Bounds {
         origin,
@@ -63,9 +70,7 @@ fn test_cursor_animation_restarts_from_current_origin() {
         Some(state),
         new_position,
         point(px(200.0), px(0.0)),
-        mid_animation,
-        duration,
-        cursor_animation_test_settings(),
+        cursor_animation_frame_context(cursor_animation_test_settings(), mid_animation),
         true,
     );
 
@@ -96,9 +101,7 @@ fn test_cursor_animation_snaps_when_layout_moves_without_cursor_change() {
         Some(state),
         position,
         point(px(60.0), px(0.0)),
-        mid_animation,
-        duration,
-        cursor_animation_test_settings(),
+        cursor_animation_frame_context(cursor_animation_test_settings(), mid_animation),
         true,
     );
 
@@ -190,19 +193,19 @@ fn test_cursor_trail_gradient_points_from_tail_to_current_cursor() {
 #[test]
 fn test_vertical_cursor_shape_animation_changes_height_not_width() {
     let started_at = Instant::now();
-    let duration = Duration::from_millis(100);
     let old_position = DisplayPoint::new(DisplayRow(0), 0);
     let new_position = DisplayPoint::new(DisplayRow(1), 0);
-    let state =
-        CursorAnimationState::settled(old_position, point(px(0.0), px(0.0)), started_at, duration);
+    let state = CursorAnimationState::settled(
+        old_position,
+        point(px(0.0), px(0.0)),
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
+    );
 
     let (frame, state) = CursorAnimationState::update(
         Some(state),
         new_position,
         point(px(0.0), px(100.0)),
-        started_at,
-        duration,
-        cursor_animation_test_settings(),
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
         true,
     );
 
@@ -221,23 +224,19 @@ fn test_vertical_cursor_shape_animation_changes_height_not_width() {
 #[test]
 fn test_diagonal_cursor_shape_animation_draws_trail() {
     let started_at = Instant::now();
-    let duration = Duration::from_millis(100);
     let old_position = DisplayPoint::new(DisplayRow(0), 10);
     let new_position = DisplayPoint::new(DisplayRow(1), 0);
     let state = CursorAnimationState::settled(
         old_position,
         point(px(100.0), px(0.0)),
-        started_at,
-        duration,
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
     );
 
     let (frame, state) = CursorAnimationState::update(
         Some(state),
         new_position,
         point(px(0.0), px(100.0)),
-        started_at,
-        duration,
-        cursor_animation_test_settings(),
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
         true,
     );
 
@@ -259,19 +258,19 @@ fn test_diagonal_cursor_shape_animation_draws_trail() {
 #[test]
 fn test_tall_cursor_shape_animation_draws_trail() {
     let started_at = Instant::now();
-    let duration = Duration::from_millis(100);
     let old_position = DisplayPoint::new(DisplayRow(0), 0);
     let new_position = DisplayPoint::new(DisplayRow(3), 0);
-    let state =
-        CursorAnimationState::settled(old_position, point(px(0.0), px(0.0)), started_at, duration);
+    let state = CursorAnimationState::settled(
+        old_position,
+        point(px(0.0), px(0.0)),
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
+    );
 
     let (frame, state) = CursorAnimationState::update(
         Some(state),
         new_position,
         point(px(0.0), px(300.0)),
-        started_at,
-        duration,
-        cursor_animation_test_settings(),
+        cursor_animation_frame_context(cursor_animation_test_settings(), started_at),
         true,
     );
 
@@ -303,9 +302,7 @@ fn test_cursor_shape_animation_can_run_without_movement() {
         Some(state),
         new_position,
         point(px(200.0), px(0.0)),
-        started_at + Duration::from_millis(50),
-        duration,
-        settings,
+        cursor_animation_frame_context(settings, started_at + Duration::from_millis(50)),
         true,
     );
 
@@ -315,4 +312,69 @@ fn test_cursor_shape_animation_can_run_without_movement() {
 
     let frame = state.frame(started_at + Duration::from_millis(100), settings.movement);
     assert_eq!(frame.trail_origin, Some(point(px(187.5), px(0.0))));
+}
+
+#[test]
+fn test_hidden_cursor_state_animates_when_visible_again() {
+    let started_at = Instant::now();
+    let settings = cursor_animation_test_settings();
+    let hidden_context = cursor_animation_frame_context(settings, started_at);
+    let visible_context =
+        cursor_animation_frame_context(settings, started_at + Duration::from_millis(20));
+    let key = CursorAnimationKey::for_selection(ReplicaId::LOCAL, 1, true);
+    let old_position = DisplayPoint::new(DisplayRow(0), 0);
+    let new_position = DisplayPoint::new(DisplayRow(1), 0);
+    let mut states = CursorAnimationStates::default();
+
+    states.sync_hidden(
+        Some(key),
+        old_position,
+        point(px(0.0), px(0.0)),
+        hidden_context,
+    );
+    let frame = states.update_visible(
+        Some(key),
+        new_position,
+        point(px(100.0), px(100.0)),
+        visible_context,
+        true,
+    );
+
+    let Some(frame) = frame else {
+        panic!("expected visible cursor animation frame");
+    };
+    assert!(frame.is_animating);
+    assert_eq!(frame.trail_origin, Some(point(px(0.0), px(0.0))));
+    assert_pixels_near(frame.origin.x, px(100.0));
+    assert_pixels_near(frame.origin.y, px(100.0));
+}
+
+#[test]
+fn test_cursor_animation_states_prune_inactive_keys() {
+    let started_at = Instant::now();
+    let settings = cursor_animation_test_settings();
+    let stale_key = CursorAnimationKey::for_selection(ReplicaId::LOCAL, 1, false);
+    let active_key = CursorAnimationKey::for_selection(ReplicaId::LOCAL, 2, false);
+    let first_context = cursor_animation_frame_context(settings, started_at);
+    let second_context =
+        cursor_animation_frame_context(settings, started_at + Duration::from_millis(16));
+    let mut states = CursorAnimationStates::default();
+
+    states.sync_hidden(
+        Some(stale_key),
+        DisplayPoint::new(DisplayRow(0), 0),
+        point(px(0.0), px(0.0)),
+        first_context,
+    );
+    states.finish_frame(first_context);
+    states.sync_hidden(
+        Some(active_key),
+        DisplayPoint::new(DisplayRow(1), 0),
+        point(px(0.0), px(20.0)),
+        second_context,
+    );
+    states.finish_frame(second_context);
+
+    assert!(!states.states.contains_key(&stale_key));
+    assert!(states.states.contains_key(&active_key));
 }
