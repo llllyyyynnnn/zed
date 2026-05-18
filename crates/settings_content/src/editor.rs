@@ -24,7 +24,7 @@ pub struct EditorSettingsContent {
     pub cursor_shape: Option<CursorShape>,
     /// Controls optional editor cursor animation.
     ///
-    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "max_trail_height_lines": 2.0 }
+    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140 }
     pub cursor_animation: Option<CursorAnimationSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
@@ -823,7 +823,7 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: true
     pub movement: Option<bool>,
-    /// Whether line-like cursor shapes leave a bounded trail during movement.
+    /// Whether line-like cursor shapes leave a fading trail during movement.
     ///
     /// Default: true
     pub shape: Option<bool>,
@@ -831,11 +831,6 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: 140
     pub duration_ms: Option<DelayMs>,
-    /// Maximum cursor trail height, measured in line heights.
-    ///
-    /// Default: 2.0
-    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
-    pub max_trail_height_lines: Option<f32>,
 }
 
 /// What to do when go to definition yields no results.

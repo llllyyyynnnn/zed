@@ -781,9 +781,9 @@ List of `string` values
 
 ## Cursor Animation
 
-- Description: Controls optional editor cursor movement and bounded trail animation.
+- Description: Controls optional editor cursor movement and fading trail animation.
 - Setting: `cursor_animation`
-- Default: `{ "enabled": false, "movement": true, "shape": true, "duration_ms": 140, "max_trail_height_lines": 2.0 }`
+- Default: `{ "enabled": false, "movement": true, "shape": true, "duration_ms": 140 }`
 
 ```json [settings]
 {
@@ -791,8 +791,7 @@ List of `string` values
     "enabled": true,
     "movement": true,
     "shape": true,
-    "duration_ms": 140,
-    "max_trail_height_lines": 2.0
+    "duration_ms": 140
   }
 }
 ```

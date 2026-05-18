@@ -236,12 +236,10 @@
     "enabled": false,
     // Whether the cursor animates between positions.
     "movement": true,
-    // Whether line-like cursor shapes leave a bounded trail during movement.
+    // Whether line-like cursor shapes leave a fading trail during movement.
     "shape": true,
     // Cursor animation duration in milliseconds.
-    "duration_ms": 140,
-    // Maximum cursor trail height, measured in line heights.
-    "max_trail_height_lines": 2.0
+    "duration_ms": 140
   },
   // Determines when the mouse cursor should be hidden in response to keyboard
   // input.

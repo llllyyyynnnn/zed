@@ -180,13 +180,12 @@ TBD: Centered layout related settings
   // Cursor shape for the default editor: bar, block, underline, hollow
   "cursor_shape": null,
 
-  // Optional editor cursor movement and bounded trail animation.
+  // Optional editor cursor movement and fading trail animation.
   "cursor_animation": {
     "enabled": false,
     "movement": true,
     "shape": true,
-    "duration_ms": 140,
-    "max_trail_height_lines": 2.0
+    "duration_ms": 140
   },
 
   // Highlight the current line in the editor: none, gutter, line, all

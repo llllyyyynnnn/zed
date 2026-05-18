@@ -76,13 +76,10 @@ pub struct CursorAnimationSettings {
     pub movement: bool,
     pub shape: bool,
     pub duration_ms: u64,
-    pub max_trail_height_lines: f32,
 }
 
 impl CursorAnimationSettings {
     pub const MAX_DURATION_MS: u64 = 1000;
-    pub const MAX_TRAIL_HEIGHT_LINES_MIN: f32 = 1.0;
-    pub const MAX_TRAIL_HEIGHT_LINES_MAX: f32 = 20.0;
 
     pub fn is_active(&self) -> bool {
         self.enabled && (self.movement || self.shape) && self.duration_ms > 0
@@ -96,7 +93,6 @@ impl Default for CursorAnimationSettings {
             movement: true,
             shape: true,
             duration_ms: 140,
-            max_trail_height_lines: 2.0,
         }
     }
 }
@@ -113,13 +109,6 @@ impl From<settings::CursorAnimationSettingsContent> for CursorAnimationSettings 
                 .map(|duration| duration.0)
                 .unwrap_or(default.duration_ms)
                 .min(Self::MAX_DURATION_MS),
-            max_trail_height_lines: settings
-                .max_trail_height_lines
-                .unwrap_or(default.max_trail_height_lines)
-                .clamp(
-                    Self::MAX_TRAIL_HEIGHT_LINES_MIN,
-                    Self::MAX_TRAIL_HEIGHT_LINES_MAX,
-                ),
         }
     }
 }
@@ -401,7 +390,6 @@ mod tests {
         assert!(settings.movement);
         assert!(settings.shape);
         assert_eq!(settings.duration_ms, 140);
-        assert_eq!(settings.max_trail_height_lines, 2.0);
         assert!(!settings.is_active());
     }
 
@@ -412,17 +400,12 @@ mod tests {
             movement: Some(true),
             shape: Some(true),
             duration_ms: Some(2000.into()),
-            max_trail_height_lines: Some(99.0),
         });
 
         assert!(settings.is_active());
         assert_eq!(
             settings.duration_ms,
             CursorAnimationSettings::MAX_DURATION_MS
-        );
-        assert_eq!(
-            settings.max_trail_height_lines,
-            CursorAnimationSettings::MAX_TRAIL_HEIGHT_LINES_MAX
         );
     }
 
