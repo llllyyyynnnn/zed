@@ -779,6 +779,23 @@ List of `string` values
 }
 ```
 
+## Cursor Animation
+
+- Description: Controls optional editor cursor movement and fading trail animation.
+- Setting: `cursor_animation`
+- Default: `{ "enabled": false, "movement": true, "shape": true, "duration_ms": 140 }`
+
+```json [settings]
+{
+  "cursor_animation": {
+    "enabled": true,
+    "movement": true,
+    "shape": true,
+    "duration_ms": 140
+  }
+}
+```
+
 ## Gutter
 
 - Description: Settings for the editor gutter

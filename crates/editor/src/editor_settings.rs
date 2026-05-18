@@ -19,6 +19,7 @@ use ui::scrollbars::ShowScrollbar;
 pub struct EditorSettings {
     pub cursor_blink: bool,
     pub cursor_shape: Option<CursorShape>,
+    pub cursor_animation: CursorAnimationSettings,
     pub current_line_highlight: CurrentLineHighlight,
     pub selection_highlight: bool,
     pub rounded_selection: bool,
@@ -67,6 +68,49 @@ pub struct EditorSettings {
     pub completion_menu_item_kind: CompletionMenuItemKind,
     pub diff_view_style: DiffViewStyle,
     pub minimum_split_diff_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorAnimationSettings {
+    pub enabled: bool,
+    pub movement: bool,
+    pub shape: bool,
+    pub duration_ms: u64,
+}
+
+impl CursorAnimationSettings {
+    pub const MAX_DURATION_MS: u64 = 1000;
+
+    pub fn is_active(&self) -> bool {
+        self.enabled && (self.movement || self.shape) && self.duration_ms > 0
+    }
+}
+
+impl Default for CursorAnimationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            movement: true,
+            shape: true,
+            duration_ms: 140,
+        }
+    }
+}
+
+impl From<settings::CursorAnimationSettingsContent> for CursorAnimationSettings {
+    fn from(settings: settings::CursorAnimationSettingsContent) -> Self {
+        let default = Self::default();
+        Self {
+            enabled: settings.enabled.unwrap_or(default.enabled),
+            movement: settings.movement.unwrap_or(default.movement),
+            shape: settings.shape.unwrap_or(default.shape),
+            duration_ms: settings
+                .duration_ms
+                .map(|duration| duration.0)
+                .unwrap_or(default.duration_ms)
+                .min(Self::MAX_DURATION_MS),
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Jupyter {
@@ -205,6 +249,7 @@ impl Settings for EditorSettings {
         Self {
             cursor_blink: editor.cursor_blink.unwrap(),
             cursor_shape: editor.cursor_shape.map(Into::into),
+            cursor_animation: editor.cursor_animation.unwrap().into(),
             current_line_highlight: editor.current_line_highlight.unwrap(),
             selection_highlight: editor.selection_highlight.unwrap(),
             rounded_selection: editor.rounded_selection.unwrap(),
@@ -330,5 +375,48 @@ pub fn ui_scrollbar_settings_from_raw(
         settings::ShowScrollbar::System => ShowScrollbar::System,
         settings::ShowScrollbar::Always => ShowScrollbar::Always,
         settings::ShowScrollbar::Never => ShowScrollbar::Never,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_animation_settings_default_to_opt_in() {
+        let settings = CursorAnimationSettings::default();
+
+        assert!(!settings.enabled);
+        assert!(settings.movement);
+        assert!(settings.shape);
+        assert_eq!(settings.duration_ms, 140);
+        assert!(!settings.is_active());
+    }
+
+    #[test]
+    fn cursor_animation_settings_are_clamped() {
+        let settings = CursorAnimationSettings::from(settings::CursorAnimationSettingsContent {
+            enabled: Some(true),
+            movement: Some(true),
+            shape: Some(true),
+            duration_ms: Some(2000.into()),
+        });
+
+        assert!(settings.is_active());
+        assert_eq!(
+            settings.duration_ms,
+            CursorAnimationSettings::MAX_DURATION_MS
+        );
+    }
+
+    #[test]
+    fn zero_duration_disables_cursor_animation_work() {
+        let settings = CursorAnimationSettings {
+            enabled: true,
+            duration_ms: 0,
+            ..CursorAnimationSettings::default()
+        };
+
+        assert!(!settings.is_active());
     }
 }

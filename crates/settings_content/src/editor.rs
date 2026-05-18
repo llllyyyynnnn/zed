@@ -22,6 +22,10 @@ pub struct EditorSettingsContent {
     ///
     /// Default: bar
     pub cursor_shape: Option<CursorShape>,
+    /// Controls optional editor cursor animation.
+    ///
+    /// Default: { "enabled": false, "movement": true, "shape": true, "duration_ms": 140 }
+    pub cursor_animation: Option<CursorAnimationSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
     /// Default: inline
@@ -806,6 +810,27 @@ pub enum CursorShape {
     Underline,
     /// A box drawn around the following character
     Hollow,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct CursorAnimationSettingsContent {
+    /// Whether the editor cursor animates.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Whether the cursor animates between positions.
+    ///
+    /// Default: true
+    pub movement: Option<bool>,
+    /// Whether line-like cursor shapes leave a fading trail during movement.
+    ///
+    /// Default: true
+    pub shape: Option<bool>,
+    /// Cursor animation duration in milliseconds.
+    ///
+    /// Default: 140
+    pub duration_ms: Option<DelayMs>,
 }
 
 /// What to do when go to definition yields no results.

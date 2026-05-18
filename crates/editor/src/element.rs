@@ -32,6 +32,10 @@ use crate::{
         ActiveScrollbarState, Autoscroll, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
         scroll_amount::ScrollAmount,
     },
+    zedfx_cursor_animation::{
+        CursorAnimationFrameContext, CursorAnimationKey, CursorAnimationSelection,
+        CursorAnimationStates, CursorAnimationViewport, CursorShapeTrail,
+    },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
@@ -41,14 +45,15 @@ use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatu
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
     Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
-    Edges, Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero, Length,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
-    MousePressureEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, PressureStage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Size, StatefulInteractiveElement,
-    Style, Styled, StyledText, TaskExt, TextAlign, TextRun, TextStyleRefinement, WeakEntity,
-    Window, anchored, deferred, div, fill, linear_color_stop, linear_gradient, outline,
-    pattern_slash, point, px, quad, relative, size, solid_background, transparent_black,
+    Edges, Element, ElementId, ElementInputHandler, Entity, Focusable as _, Font, FontId,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement,
+    IsZero, Length, Modifiers, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
+    PressureStage, ScrollDelta, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Size,
+    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
+    TextStyleRefinement, WeakEntity, Window, anchored, deferred, div, fill, linear_color_stop,
+    linear_gradient, outline, pattern_slash, point, px, quad, relative, size, solid_background,
+    transparent_black,
 };
 use itertools::Itertools;
 use language::{
@@ -85,7 +90,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sum_tree::Bias;
-use text::{BufferId, SelectionGoal};
+use text::{BufferId, ReplicaId, SelectionGoal};
 use theme::{ActiveTheme, Appearance, PlayerColor};
 use theme_settings::BufferLineHeight;
 use ui::utils::ensure_minimum_contrast;
@@ -114,6 +119,7 @@ struct LineHighlightSpec {
 struct SelectionLayout {
     head: DisplayPoint,
     cursor_shape: CursorShape,
+    cursor_animation_key: Option<CursorAnimationKey>,
     is_newest: bool,
     is_local: bool,
     range: Range<DisplayPoint>,
@@ -134,11 +140,15 @@ impl SelectionLayout {
         line_mode: bool,
         cursor_offset: bool,
         cursor_shape: CursorShape,
+        cursor_animation_replica_id: Option<ReplicaId>,
         map: &DisplaySnapshot,
         is_newest: bool,
         is_local: bool,
         user_name: Option<SharedString>,
     ) -> Self {
+        let cursor_animation_key = cursor_animation_replica_id.map(|replica_id| {
+            CursorAnimationKey::for_selection(replica_id, selection.id, is_newest)
+        });
         let point_selection = selection.map(|p| p.to_point(map.buffer_snapshot()));
         let display_selection = point_selection.map(|p| p.to_display_point(map));
         let mut range = display_selection.range();
@@ -176,6 +186,7 @@ impl SelectionLayout {
         Self {
             head,
             cursor_shape,
+            cursor_animation_key,
             is_newest,
             is_local,
             range,
@@ -183,6 +194,37 @@ impl SelectionLayout {
             user_name,
         }
     }
+
+    fn cursor_animation_selection(&self) -> CursorAnimationSelection {
+        CursorAnimationSelection::new(self.cursor_animation_key, self.head)
+    }
+}
+
+fn local_cursor_animation_selections(
+    editor: &Editor,
+    snapshot: &EditorSnapshot,
+) -> Vec<CursorAnimationSelection> {
+    let newest_selection_id = editor.selections.newest_anchor().id;
+    editor
+        .selections
+        .all::<Point>(&snapshot.display_snapshot)
+        .into_iter()
+        .map(|selection| {
+            let is_newest = selection.id == newest_selection_id;
+            SelectionLayout::new(
+                selection,
+                editor.selections.line_mode(),
+                editor.cursor_offset_on_selection,
+                editor.cursor_shape,
+                Some(ReplicaId::LOCAL),
+                &snapshot.display_snapshot,
+                is_newest,
+                editor.leader_id.is_none(),
+                None,
+            )
+            .cursor_animation_selection()
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -1572,16 +1614,17 @@ impl EditorElement {
         editor_with_selections.update(cx, |editor, cx| {
             if editor.show_local_selections {
                 let mut layouts = Vec::new();
-                let newest = editor.selections.newest(&editor.display_snapshot(cx));
+                let newest_selection_id = editor.selections.newest_anchor().id;
                 for selection in local_selections.iter().cloned() {
                     let is_empty = selection.start == selection.end;
-                    let is_newest = selection == newest;
+                    let is_newest = selection.id == newest_selection_id;
 
                     let layout = SelectionLayout::new(
                         selection,
                         editor.selections.line_mode(),
                         editor.cursor_offset_on_selection,
                         editor.cursor_shape,
+                        Some(ReplicaId::LOCAL),
                         &snapshot.display_snapshot,
                         is_newest,
                         editor.leader_id.is_none(),
@@ -1629,6 +1672,7 @@ impl EditorElement {
                         false,
                         editor.cursor_offset_on_selection,
                         CursorShape::Bar,
+                        None,
                         &snapshot.display_snapshot,
                         false,
                         false,
@@ -1693,6 +1737,7 @@ impl EditorElement {
                             selection.line_mode,
                             editor.cursor_offset_on_selection,
                             selection.cursor_shape,
+                            Some(selection.replica_id),
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1713,6 +1758,7 @@ impl EditorElement {
                             line_mode,
                             cursor_offset_on_selection,
                             cursor_shape,
+                            Some(ReplicaId::LOCAL),
                             &snapshot.display_snapshot,
                             false,
                             false,
@@ -1804,16 +1850,39 @@ impl EditorElement {
             let mut cursors = Vec::new();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
+            let cursor_animation_context =
+                CursorAnimationFrameContext::new(EditorSettings::get_global(cx).cursor_animation);
+            if cursor_animation_context.is_active() {
+                let text_layout_details = editor.text_layout_details(window, cx);
+                let viewport = CursorAnimationViewport {
+                    snapshot,
+                    text_layout_details: &text_layout_details,
+                    row_block_types,
+                    visible_rows: visible_display_row_range.clone(),
+                    show_local_cursors,
+                    text_align: self.style.text.text_align,
+                    content_width: text_hitbox.size.width,
+                    scroll_position,
+                    scroll_pixel_position,
+                    line_height,
+                };
+                editor.cursor_animation_states.sync_hidden_selections(
+                    local_cursor_animation_selections(editor, snapshot),
+                    &viewport,
+                    cursor_animation_context,
+                );
+            }
 
             for (player_color, selections) in selections {
                 for selection in selections {
                     let cursor_position = selection.head;
 
+                    if selection.is_local && !show_local_cursors {
+                        continue;
+                    }
+
                     let in_range = visible_display_row_range.contains(&cursor_position.row());
-                    if (selection.is_local && !show_local_cursors)
-                        || !in_range
-                        || row_block_types.get(&cursor_position.row()) == Some(&true)
-                    {
+                    if !in_range || row_block_types.get(&cursor_position.row()) == Some(&true) {
                         continue;
                     }
 
@@ -1939,8 +2008,11 @@ impl EditorElement {
                         color: player_color.cursor,
                         block_width,
                         origin: point(x, y),
+                        logical_position: cursor_position,
                         line_height,
                         shape: selection.cursor_shape,
+                        cursor_animation_key: selection.cursor_animation_key,
+                        shape_trail: None,
                         block_text,
                         cursor_name: None,
                     };
@@ -1949,10 +2021,19 @@ impl EditorElement {
                         color: self.style.background,
                         is_top_row: cursor_position.row().0 == 0,
                     });
+                    cursor.apply_animation(
+                        &mut editor.cursor_animation_states,
+                        cursor_animation_context,
+                        window,
+                    );
                     cursor.layout(content_origin, cursor_name, window, cx);
                     cursors.push(cursor);
                 }
             }
+
+            editor
+                .cursor_animation_states
+                .finish_frame(cursor_animation_context);
 
             cursors
         });
@@ -8037,6 +8118,7 @@ impl EditorElement {
                             head: start,
                             range: start..end,
                             cursor_shape: CursorShape::Bar,
+                            cursor_animation_key: None,
                             is_newest: false,
                             is_local: false,
                             active_rows: start.row()..end.row(),
@@ -10313,6 +10395,7 @@ impl Element for EditorElement {
                                 editor.selections.line_mode(),
                                 editor.cursor_offset_on_selection,
                                 editor.cursor_shape,
+                                Some(ReplicaId::LOCAL),
                                 &snapshot,
                                 true,
                                 true,
@@ -12357,10 +12440,13 @@ const LABEL_LINE_HEIGHT_PADDING_PX: f32 = 2.0;
 
 pub struct CursorLayout {
     origin: gpui::Point<Pixels>,
+    logical_position: DisplayPoint,
     block_width: Pixels,
     line_height: Pixels,
     color: Hsla,
     shape: CursorShape,
+    cursor_animation_key: Option<CursorAnimationKey>,
+    shape_trail: Option<CursorShapeTrail>,
     block_text: Option<ShapedLine>,
     cursor_name: Option<AnyElement>,
 }
@@ -12383,38 +12469,96 @@ impl CursorLayout {
     ) -> CursorLayout {
         CursorLayout {
             origin,
+            logical_position: DisplayPoint::new(DisplayRow(0), 0),
             block_width,
             line_height,
             color,
             shape,
+            cursor_animation_key: None,
+            shape_trail: None,
             block_text,
             cursor_name: None,
         }
     }
 
     pub fn bounding_rect(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
-        Bounds {
-            origin: self.origin + origin,
-            size: size(self.block_width, self.line_height),
-        }
+        self.bounds(origin)
     }
 
     fn bounds(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
+        if let Some(trail) = &self.shape_trail {
+            let bounds = trail.bounds();
+            return Bounds {
+                origin: bounds.origin + origin,
+                size: bounds.size,
+            };
+        }
+
+        let bounds = self.shape_bounds_at(self.origin);
+        Bounds {
+            origin: bounds.origin + origin,
+            size: bounds.size,
+        }
+    }
+
+    fn shape_bounds_at(&self, origin: gpui::Point<Pixels>) -> Bounds<Pixels> {
         match self.shape {
             CursorShape::Bar => Bounds {
-                origin: self.origin + origin,
+                origin,
                 size: size(px(2.0), self.line_height),
             },
             CursorShape::Block | CursorShape::Hollow => Bounds {
-                origin: self.origin + origin,
+                origin,
                 size: size(self.block_width, self.line_height),
             },
             CursorShape::Underline => Bounds {
-                origin: self.origin
-                    + origin
-                    + gpui::Point::new(Pixels::ZERO, self.line_height - px(2.0)),
+                origin: origin + point(Pixels::ZERO, self.line_height - px(2.0)),
                 size: size(self.block_width, px(2.0)),
             },
+        }
+    }
+
+    fn apply_animation(
+        &mut self,
+        cursor_animation_states: &mut CursorAnimationStates,
+        frame_context: CursorAnimationFrameContext,
+        window: &mut Window,
+    ) {
+        let settings = frame_context.settings();
+        if !settings.is_active() {
+            return;
+        }
+
+        let target_origin = self.origin;
+        let logical_position = self.logical_position;
+        let trail_enabled =
+            settings.shape && matches!(self.shape, CursorShape::Bar | CursorShape::Underline);
+
+        let Some(frame) = cursor_animation_states.update_visible(
+            self.cursor_animation_key,
+            logical_position,
+            target_origin,
+            frame_context,
+            trail_enabled,
+        ) else {
+            return;
+        };
+
+        self.origin = frame.origin;
+
+        if let Some(trail_origin) = frame.trail_origin
+            && trail_origin != target_origin
+        {
+            self.shape_trail = Some(CursorShapeTrail::between(
+                self.shape_bounds_at(trail_origin),
+                self.shape_bounds_at(target_origin),
+                trail_origin,
+                target_origin,
+            ));
+        }
+
+        if frame.is_animating {
+            window.request_animation_frame();
         }
     }
 
@@ -12426,7 +12570,11 @@ impl CursorLayout {
         cx: &mut App,
     ) {
         if let Some(cursor_name) = cursor_name {
-            let bounds = self.bounds(origin);
+            let cursor_bounds = self.shape_bounds_at(self.origin);
+            let bounds = Bounds {
+                origin: cursor_bounds.origin + origin,
+                size: cursor_bounds.size,
+            };
             let text_size = self.line_height / 1.5;
 
             let name_origin = if cursor_name.is_top_row {
@@ -12461,18 +12609,26 @@ impl CursorLayout {
     pub fn paint(&mut self, origin: gpui::Point<Pixels>, window: &mut Window, cx: &mut App) {
         let bounds = window.pixel_snap_bounds(self.bounds(origin));
 
-        //Draw background or border quad
-        let cursor = if matches!(self.shape, CursorShape::Hollow) {
-            outline(bounds, self.color, BorderStyle::Solid)
-        } else {
-            fill(bounds, self.color)
-        };
-
         if let Some(name) = &mut self.cursor_name {
             name.paint(window, cx);
         }
 
-        window.paint_quad(cursor);
+        if let Some(trail) = &self.shape_trail {
+            let solid_bounds = self.shape_bounds_at(self.origin);
+            trail.paint(
+                origin,
+                window.pixel_snap_bounds(Bounds {
+                    origin: solid_bounds.origin + origin,
+                    size: solid_bounds.size,
+                }),
+                self.color,
+                window,
+            );
+        } else if matches!(self.shape, CursorShape::Hollow) {
+            window.paint_quad(outline(bounds, self.color, BorderStyle::Solid));
+        } else {
+            window.paint_quad(fill(bounds, self.color));
+        }
 
         if let Some(block_text) = &self.block_text {
             block_text
@@ -13832,6 +13988,7 @@ mod tests {
             let spanning_selection = SelectionLayout {
                 head: DisplayPoint::new(DisplayRow(3), 7),
                 cursor_shape: CursorShape::Bar,
+                cursor_animation_key: None,
                 is_newest: true,
                 is_local: true,
                 range: DisplayPoint::new(DisplayRow(1), 5)..DisplayPoint::new(DisplayRow(3), 7),
@@ -13881,6 +14038,7 @@ mod tests {
             let selection = SelectionLayout {
                 head: DisplayPoint::new(DisplayRow(2), 0),
                 cursor_shape: CursorShape::Bar,
+                cursor_animation_key: None,
                 is_newest: true,
                 is_local: true,
                 range: DisplayPoint::new(DisplayRow(1), 5)..DisplayPoint::new(DisplayRow(3), 0),
@@ -14118,6 +14276,22 @@ mod tests {
         assert_eq!(
             calculate_wrap_width(SoftWrap::Bounded(200), px(400.0), em_width),
             Some(px(400.0)),
+        );
+    }
+
+    #[test]
+    fn test_local_newest_cursor_animation_key_survives_selection_id_changes() {
+        assert_eq!(
+            CursorAnimationKey::for_selection(ReplicaId::LOCAL, 12, true).selection_id,
+            CursorAnimationKey::LOCAL_NEWEST_SELECTION_ID
+        );
+        assert_eq!(
+            CursorAnimationKey::for_selection(ReplicaId::LOCAL, 14, true).selection_id,
+            CursorAnimationKey::LOCAL_NEWEST_SELECTION_ID
+        );
+        assert_eq!(
+            CursorAnimationKey::for_selection(ReplicaId::LOCAL, 14, false).selection_id,
+            14
         );
     }
 }

@@ -230,6 +230,17 @@
   //
   // Default: "bar"
   "cursor_shape": "bar",
+  // Controls optional editor cursor animation.
+  "cursor_animation": {
+    // Whether the editor cursor animates.
+    "enabled": false,
+    // Whether the cursor animates between positions.
+    "movement": true,
+    // Whether line-like cursor shapes leave a fading trail during movement.
+    "shape": true,
+    // Cursor animation duration in milliseconds.
+    "duration_ms": 140
+  },
   // Determines when the mouse cursor should be hidden in response to keyboard
   // input.
   //

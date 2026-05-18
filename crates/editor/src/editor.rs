@@ -44,6 +44,8 @@ mod selections_collection;
 pub mod semantic_tokens;
 mod split;
 pub mod split_editor_view;
+#[path = "ZedFX/cursor_animation.rs"]
+mod zedfx_cursor_animation;
 
 mod bookmarks;
 #[cfg(test)]
@@ -265,6 +267,7 @@ use workspace::{
 };
 pub use zed_actions::editor::RevealInFileManager;
 use zed_actions::editor::{MoveDown, MoveUp};
+use zedfx_cursor_animation::CursorAnimationStates;
 
 use crate::{
     code_context_menus::CompletionsMenuSource,
@@ -1021,6 +1024,7 @@ pub struct Editor {
     next_color_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
+    cursor_animation_states: CursorAnimationStates,
     gutter_dimensions: GutterDimensions,
     style: Option<EditorStyle>,
     text_style_refinement: Option<TextStyleRefinement>,
@@ -2214,6 +2218,7 @@ impl Editor {
             inline_value_cache: InlineValueCache::new(inlay_hint_settings.show_value_hints),
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
+            cursor_animation_states: CursorAnimationStates::default(),
             last_bounds: None,
             last_position_map: None,
             expect_bounds_change: None,
