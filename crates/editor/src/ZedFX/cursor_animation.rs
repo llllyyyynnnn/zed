@@ -1,5 +1,13 @@
-use crate::{DisplayPoint, editor_settings::CursorAnimationSettings};
-use gpui::{Bounds, Hsla, Pixels, Window, fill, linear_color_stop, linear_gradient, point, px};
+use crate::{
+    DisplayPoint, EditorSnapshot, RowExt,
+    editor_settings::CursorAnimationSettings,
+    movement::TextLayoutDetails,
+    scroll::{ScrollOffset, ScrollPixelOffset},
+};
+use clock::ReplicaId;
+use gpui::{
+    Bounds, Hsla, Pixels, TextAlign, Window, fill, linear_color_stop, linear_gradient, point, px,
+};
 use std::time::{Duration, Instant};
 
 const TRAIL_FADE_START: f32 = 0.0;
@@ -8,6 +16,60 @@ const FULL_CIRCLE_DEGREES: f32 = 360.0;
 const TRAIL_POLYGON_POINTS: usize = 6;
 
 type TrailPolygon = [gpui::Point<Pixels>; TRAIL_POLYGON_POINTS];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CursorAnimationKey {
+    pub(crate) replica_id: ReplicaId,
+    pub(crate) selection_id: usize,
+}
+
+impl CursorAnimationKey {
+    pub(crate) const LOCAL_NEWEST_SELECTION_ID: usize = usize::MAX;
+
+    pub(crate) fn for_selection(
+        replica_id: ReplicaId,
+        selection_id: usize,
+        is_newest: bool,
+    ) -> Self {
+        let selection_id = if replica_id == ReplicaId::LOCAL && is_newest {
+            Self::LOCAL_NEWEST_SELECTION_ID
+        } else {
+            selection_id
+        };
+
+        Self {
+            replica_id,
+            selection_id,
+        }
+    }
+}
+
+pub(crate) fn cursor_origin_for_display_point(
+    snapshot: &EditorSnapshot,
+    cursor_position: DisplayPoint,
+    text_layout_details: &TextLayoutDetails,
+    text_align: TextAlign,
+    content_width: Pixels,
+    scroll_position: gpui::Point<ScrollOffset>,
+    scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+    line_height: Pixels,
+) -> gpui::Point<Pixels> {
+    let row_layout = snapshot
+        .display_snapshot
+        .layout_row(cursor_position.row(), text_layout_details);
+    let alignment_offset = match text_align {
+        TextAlign::Left => Pixels::ZERO,
+        TextAlign::Center => (content_width - row_layout.width) / 2.0,
+        TextAlign::Right => content_width - row_layout.width,
+    };
+    let x = row_layout.x_for_index(cursor_position.column() as usize) + alignment_offset
+        - scroll_pixel_position.x.into();
+    let y = ((cursor_position.row().as_f64() - scroll_position.y)
+        * ScrollPixelOffset::from(line_height))
+    .into();
+
+    point(x, y)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CursorAnimationState {
@@ -50,7 +112,7 @@ impl CursorAnimationState {
         }
     }
 
-    fn settled(
+    pub(crate) fn settled(
         logical_position: DisplayPoint,
         origin: gpui::Point<Pixels>,
         now: Instant,

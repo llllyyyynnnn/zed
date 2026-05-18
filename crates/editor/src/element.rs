@@ -32,7 +32,9 @@ use crate::{
         ActiveScrollbarState, Autoscroll, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
         scroll_amount::ScrollAmount,
     },
-    zedfx_cursor_animation::{CursorAnimationState, CursorShapeTrail},
+    zedfx_cursor_animation::{
+        CursorAnimationKey, CursorAnimationState, CursorShapeTrail, cursor_origin_for_display_point,
+    },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
@@ -42,7 +44,7 @@ use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatu
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
     Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
-    Edges, Element, ElementId, ElementInputHandler, Entity, EntityId, Focusable as _, Font, FontId,
+    Edges, Element, ElementId, ElementInputHandler, Entity, Focusable as _, Font, FontId,
     FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement,
     IsZero, Length, Modifiers, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
@@ -122,33 +124,6 @@ struct SelectionLayout {
     range: Range<DisplayPoint>,
     active_rows: Range<DisplayRow>,
     user_name: Option<SharedString>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CursorAnimationKey {
-    replica_id: ReplicaId,
-    selection_id: usize,
-}
-
-impl CursorAnimationKey {
-    const LOCAL_NEWEST_SELECTION_ID: usize = usize::MAX;
-
-    fn new(replica_id: ReplicaId, selection_id: usize) -> Self {
-        Self {
-            replica_id,
-            selection_id,
-        }
-    }
-
-    fn for_selection(replica_id: ReplicaId, selection_id: usize, is_newest: bool) -> Self {
-        let selection_id = if replica_id == ReplicaId::LOCAL && is_newest {
-            Self::LOCAL_NEWEST_SELECTION_ID
-        } else {
-            selection_id
-        };
-
-        Self::new(replica_id, selection_id)
-    }
 }
 
 struct InlineBlameLayout {
@@ -1607,10 +1582,10 @@ impl EditorElement {
         editor_with_selections.update(cx, |editor, cx| {
             if editor.show_local_selections {
                 let mut layouts = Vec::new();
-                let newest = editor.selections.newest(&editor.display_snapshot(cx));
+                let newest_selection_id = editor.selections.newest_anchor().id;
                 for selection in local_selections.iter().cloned() {
                     let is_empty = selection.start == selection.end;
-                    let is_newest = selection == newest;
+                    let is_newest = selection.id == newest_selection_id;
 
                     let layout = SelectionLayout::new(
                         selection,
@@ -1839,22 +1814,73 @@ impl EditorElement {
         cx: &mut App,
     ) -> Vec<CursorLayout> {
         let mut autoscroll_bounds = None;
-        let editor_id = self.editor.entity_id();
         let cursor_layouts = self.editor.update(cx, |editor, cx| {
             let mut cursors = Vec::new();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
             let cursor_animation_settings = EditorSettings::get_global(cx).cursor_animation;
+            let mut active_cursor_animation_keys = HashSet::default();
+            if cursor_animation_settings.is_active() {
+                let text_layout_details = editor.text_layout_details(window, cx);
+                let newest_selection_id = editor.selections.newest_anchor().id;
+
+                for selection in editor.selections.all::<Point>(&snapshot.display_snapshot) {
+                    let is_newest = selection.id == newest_selection_id;
+                    let selection = SelectionLayout::new(
+                        selection,
+                        editor.selections.line_mode(),
+                        editor.cursor_offset_on_selection,
+                        editor.cursor_shape,
+                        Some(ReplicaId::LOCAL),
+                        &snapshot.display_snapshot,
+                        is_newest,
+                        editor.leader_id.is_none(),
+                        None,
+                    );
+                    let cursor_position = selection.head;
+                    let cursor_is_visible = show_local_cursors
+                        && visible_display_row_range.contains(&cursor_position.row())
+                        && row_block_types.get(&cursor_position.row()) != Some(&true);
+                    if cursor_is_visible {
+                        if let Some(key) = selection.cursor_animation_key {
+                            active_cursor_animation_keys.insert(key);
+                        }
+                        continue;
+                    }
+
+                    let origin = cursor_origin_for_display_point(
+                        snapshot,
+                        cursor_position,
+                        &text_layout_details,
+                        self.style.text.text_align,
+                        text_hitbox.size.width,
+                        scroll_position,
+                        scroll_pixel_position,
+                        line_height,
+                    );
+                    if let Some(key) = selection.cursor_animation_key {
+                        active_cursor_animation_keys.insert(key);
+                    }
+                    CursorLayout::sync_hidden_animation_state(
+                        &mut editor.cursor_animation_states,
+                        selection.cursor_animation_key,
+                        cursor_position,
+                        origin,
+                        cursor_animation_settings,
+                    );
+                }
+            }
 
             for (player_color, selections) in selections {
                 for selection in selections {
                     let cursor_position = selection.head;
 
+                    if selection.is_local && !show_local_cursors {
+                        continue;
+                    }
+
                     let in_range = visible_display_row_range.contains(&cursor_position.row());
-                    if (selection.is_local && !show_local_cursors)
-                        || !in_range
-                        || row_block_types.get(&cursor_position.row()) == Some(&true)
-                    {
+                    if !in_range || row_block_types.get(&cursor_position.row()) == Some(&true) {
                         continue;
                     }
 
@@ -1993,10 +2019,25 @@ impl EditorElement {
                         color: self.style.background,
                         is_top_row: cursor_position.row().0 == 0,
                     });
-                    cursor.apply_animation(editor_id, cursor_animation_settings, window);
+                    if let Some(key) = cursor.cursor_animation_key {
+                        active_cursor_animation_keys.insert(key);
+                    }
+                    cursor.apply_animation(
+                        &mut editor.cursor_animation_states,
+                        cursor_animation_settings,
+                        window,
+                    );
                     cursor.layout(content_origin, cursor_name, window, cx);
                     cursors.push(cursor);
                 }
+            }
+
+            if cursor_animation_settings.is_active() {
+                editor
+                    .cursor_animation_states
+                    .retain(|key, _| active_cursor_animation_keys.contains(key));
+            } else {
+                editor.cursor_animation_states.clear();
             }
 
             cursors
@@ -12490,14 +12531,10 @@ impl CursorLayout {
 
     fn apply_animation(
         &mut self,
-        editor_id: EntityId,
+        cursor_animation_states: &mut HashMap<CursorAnimationKey, CursorAnimationState>,
         settings: CursorAnimationSettings,
         window: &mut Window,
     ) {
-        let Some(key) = self.cursor_animation_key else {
-            return;
-        };
-
         if !settings.is_active() {
             return;
         }
@@ -12509,36 +12546,20 @@ impl CursorLayout {
             settings.shape && matches!(self.shape, CursorShape::Bar | CursorShape::Underline);
         let now = Instant::now();
 
-        let frame =
-            window.with_element_namespace(("cursor_animation_editor", editor_id), |window| {
-                window.with_element_namespace(
-                    (
-                        "cursor_animation_replica",
-                        u32::from(key.replica_id.as_u16()),
-                    ),
-                    |window| {
-                        window.with_global_id(
-                            ("cursor_animation_selection", key.selection_id).into(),
-                            |global_id, window| {
-                                window.with_element_state::<CursorAnimationState, _>(
-                                    global_id,
-                                    |state, _| {
-                                        CursorAnimationState::update(
-                                            state,
-                                            logical_position,
-                                            target_origin,
-                                            now,
-                                            duration,
-                                            settings,
-                                            trail_enabled,
-                                        )
-                                    },
-                                )
-                            },
-                        )
-                    },
-                )
-            });
+        let Some(key) = self.cursor_animation_key else {
+            return;
+        };
+        let state = cursor_animation_states.remove(&key);
+        let (frame, state) = CursorAnimationState::update(
+            state,
+            logical_position,
+            target_origin,
+            now,
+            duration,
+            settings,
+            trail_enabled,
+        );
+        cursor_animation_states.insert(key, state);
 
         self.origin = frame.origin;
 
@@ -12556,6 +12577,28 @@ impl CursorLayout {
         if frame.is_animating {
             window.request_animation_frame();
         }
+    }
+
+    fn sync_hidden_animation_state(
+        cursor_animation_states: &mut HashMap<CursorAnimationKey, CursorAnimationState>,
+        cursor_animation_key: Option<CursorAnimationKey>,
+        logical_position: DisplayPoint,
+        origin: gpui::Point<Pixels>,
+        settings: CursorAnimationSettings,
+    ) {
+        if !settings.is_active() {
+            return;
+        }
+
+        let duration = Duration::from_millis(settings.duration_ms);
+        let now = Instant::now();
+        let Some(key) = cursor_animation_key else {
+            return;
+        };
+        cursor_animation_states.insert(
+            key,
+            CursorAnimationState::settled(logical_position, origin, now, duration),
+        );
     }
 
     pub fn layout(
